@@ -450,6 +450,18 @@ trap 'sync; poweroff -f' USR2
 trap 'sync; reboot -f'   TERM
 trap 'sync; halt -f'     USR1
 
+# E2B's in-guest agent, if the overlay baked it in. Runs as root so it can
+# switch uid per request (SysProcAttr.Credential). -isnotfc: do not poll
+# Firecracker's MMDS for config; -no-cgroups: no cgroup v2 setup. vsockfwd
+# makes its TCP port reachable from the host over vsock. Both are respawned by
+# a loop rather than a supervisor; see NOTES.md "PID 1".
+if [ -x /usr/bin/envd ]; then
+    adduser -D -u 1000 -s /bin/sh -h /home/user user 2>/dev/null
+    mkdir -p /home/user && chown user:user /home/user
+    ( while :; do /usr/bin/envd -isnotfc -no-cgroups >>/run/envd.log 2>&1; sleep 1; done ) &
+    ( while :; do /usr/bin/vsockfwd 49983 127.0.0.1:49983 >>/run/vsockfwd.log 2>&1; sleep 1; done ) &
+fi
+
 read up _ < /proc/uptime
 echo "THIMBLE_BOOT_OK uptime=${up}s $(awk '/^(MemTotal|MemFree|MemAvailable)/{printf "%%s%%s ", $1, $2}' /proc/meminfo)kB"
 

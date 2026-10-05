@@ -1,27 +1,26 @@
 // thimble is a macOS-native microVM sandbox orchestrator in the spirit of E2B.
 //
-// Phase 1: `thimble boot` starts one Linux guest with its serial console on
-// the terminal and reports boot latency and host memory cost.
+//	thimble boot    phase 1: one guest with its serial console on the terminal
+//	thimble run     phase 2: run a command in a guest through envd over vsock
+//	thimble limits  what the framework allows on this host
 package main
 
 import (
 	"bufio"
-	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/alexcsalinas/thimble/internal/envd"
 	"github.com/alexcsalinas/thimble/internal/hostmem"
 	"github.com/alexcsalinas/thimble/internal/rawterm"
 	"github.com/alexcsalinas/thimble/internal/vm"
 )
-
-const readyMarker = "THIMBLE_BOOT_OK"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -32,6 +31,8 @@ func main() {
 	switch os.Args[1] {
 	case "boot":
 		err = boot(os.Args[2:])
+	case "run":
+		err = run(os.Args[2:])
 	case "limits":
 		minMem, maxMem, minCPU, maxCPU := vm.Limits()
 		fmt.Printf("memory: %s .. %s\ncpus:   %d .. %d\n", hostmem.MiB(minMem), hostmem.MiB(maxMem), minCPU, maxCPU)
@@ -47,206 +48,147 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  thimble boot   -kernel K -initrd I [-mem MiB] [-cpus N] [-cmdline S] [-bench]
+  thimble boot   [-kernel K] [-initrd I] [-mem MiB] [-cpus N] [-cmdline S] [-bench]
+  thimble run    [same flags] [-user U] [-cwd D] -- cmd [args...]
   thimble limits`)
 }
 
-func boot(args []string) error {
-	fs := flag.NewFlagSet("boot", flag.ExitOnError)
+// guestFlags registers the flags shared by every subcommand that boots a VM.
+func guestFlags(fs *flag.FlagSet) func(echo bool) launchOpts {
 	kernel := fs.String("kernel", "build/guest/vmlinux", "uncompressed arm64 kernel Image")
 	initrd := fs.String("initrd", "build/guest/initramfs.cpio.gz", "initramfs")
 	cmdline := fs.String("cmdline", "console=hvc0 loglevel=4 panic=-1", "kernel command line")
 	mem := fs.Uint64("mem", 256, "guest memory in MiB")
 	cpus := fs.Uint("cpus", 1, "guest vCPUs")
+	timeout := fs.Duration("timeout", 30*time.Second, "give up if the guest is not ready in time")
+	return func(echo bool) launchOpts {
+		return launchOpts{kernel: *kernel, initrd: *initrd, cmdline: *cmdline, mem: *mem, cpus: *cpus, echo: echo, timeout: *timeout}
+	}
+}
+
+func boot(args []string) error {
+	fs := flag.NewFlagSet("boot", flag.ExitOnError)
+	opts := guestFlags(fs)
 	bench := fs.Bool("bench", false, "boot, wait for the ready marker, report, stop")
 	showConsole := fs.Bool("console", true, "show guest console output (always on when interactive)")
-	timeout := fs.Duration("timeout", 30*time.Second, "give up if the ready marker is not seen")
 	fs.Parse(args)
 
-	minMem, _, _, _ := vm.Limits()
-	if *mem<<20 < minMem {
-		return fmt.Errorf("-mem %d MiB is below the framework minimum of %s", *mem, hostmem.MiB(minMem))
-	}
 	interactive := !*bench && rawterm.IsTerminal(os.Stdin)
-	echo := interactive || *showConsole
-
-	// Guest console goes through pipes so we can watch for the ready marker
-	// (output) and intercept the detach key (input).
-	outR, outW, err := os.Pipe()
+	g, err := launch(opts(interactive || *showConsole))
 	if err != nil {
 		return err
 	}
-	inR, inW, err := os.Pipe()
-	if err != nil {
-		return err
+	stopOnSignal(g)
+
+	if *bench {
+		time.Sleep(2 * time.Second)
+		fmt.Fprint(os.Stderr, "\r\n--- thimble boot report ---\r\n", g.bootReport(), g.memReport("2s after ready"))
+		if err := g.m.Stop(); err != nil {
+			return fmt.Errorf("stop: %w", err)
+		}
+		return g.m.WaitStopped(10 * time.Second)
 	}
 
-	m, err := vm.New(vm.Config{
-		Kernel: *kernel, Initrd: *initrd, Cmdline: *cmdline,
-		CPUs: *cpus, MemoryMiB: *mem,
-		ConsoleIn: inR, ConsoleOut: outW,
-	})
-	if err != nil {
-		return err
-	}
-
-	readyCh := make(chan ready, 1)
-	firstByte := make(chan time.Time, 1)
-	go watchConsole(outR, echo, firstByte, readyCh)
-
-	var restore func()
+	fmt.Fprint(os.Stderr, "\r\n--- thimble boot report ---\r\n", g.bootReport(), g.memReport("at ready"))
 	if interactive {
 		st, err := rawterm.MakeRaw(os.Stdin)
 		if err != nil {
 			return err
 		}
-		restore = func() { st.Restore() }
-		defer restore()
+		defer st.Restore()
 		fmt.Fprintf(os.Stderr, "thimble: console attached, Ctrl-] to detach and kill the vm\r\n")
-		go forwardStdin(inW, func() { m.Stop() })
+		go forwardStdin(g.consoleW, func() { g.m.Stop() })
 	} else {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		go func() { <-sig; m.Stop() }()
+		// Scripted use: `printf 'uname -a\npoweroff\n' | thimble boot`.
+		go forwardStdin(g.consoleW, func() {})
 	}
-
-	// The guest's memory lives in a framework helper process, not in ours.
-	// Snapshot the helper pids around Start to learn which one is ours.
-	helpersBefore, _ := hostmem.Helpers()
-	selfBase, _ := hostmem.Self()
-
-	t0 := time.Now()
-	if err := m.Start(); err != nil {
-		return fmt.Errorf("start: %w", err)
-	}
-	helpersAfter, _ := hostmem.Helpers()
-	helper := hostmem.NewHelper(helpersBefore, helpersAfter)
-	memOf := func() hostmem.Usage {
-		if helper == 0 {
-			return hostmem.Usage{}
-		}
-		u, _ := hostmem.Of(helper)
-		return u
-	}
-
-	var tFirst, tReady time.Time
-	var markerLine string
-	select {
-	case tFirst = <-firstByte:
-	case <-time.After(*timeout):
-		m.Stop()
-		return fmt.Errorf("no console output within %s", *timeout)
-	}
-	select {
-	case r := <-readyCh:
-		tReady, markerLine = r.at, r.line
-	case <-time.After(*timeout):
-		m.Stop()
-		return fmt.Errorf("guest never printed %s within %s", readyMarker, *timeout)
-	}
-	atReady := memOf()
-	if !interactive && !*bench {
-		// Scripted use: `printf 'uname -a\npoweroff\n' | thimble boot`. Start
-		// pumping only now, so nothing is written before the guest's tty exists.
-		go forwardStdin(inW, func() {})
-	}
-
-	report := func(settled hostmem.Usage) string {
-		var b strings.Builder
-		w := func(f string, a ...any) { fmt.Fprintf(&b, f+"\r\n", a...) }
-		w("")
-		w("--- thimble boot report ---")
-		w("guest:              %d vCPU, %d MiB, kernel %s", *cpus, *mem, *kernel)
-		w("first console byte: %8.1f ms  (vm.Start -> kernel printed something)", ms(tFirst.Sub(t0)))
-		w("userspace ready:    %8.1f ms  (vm.Start -> /init printed %s)", ms(tReady.Sub(t0)), readyMarker)
-		if u := guestUptime(markerLine); u != "" {
-			w("guest's own clock:  %8s s   (/proc/uptime when /init ran)", u)
-		}
-		w("guest meminfo:      %s", strings.TrimSpace(markerLine[strings.Index(markerLine, " ")+1:]))
-		w("host memory (resident / phys_footprint):")
-		w("  thimble itself:          %10s / %s", hostmem.MiB(selfBase.Resident), hostmem.MiB(selfBase.Footprint))
-		if helper == 0 {
-			w("  vm helper:               not found (could not identify com.apple.Virtualization.VirtualMachine pid)")
-		} else {
-			w("  vm helper pid %d, at ready: %10s / %s", helper, hostmem.MiB(atReady.Resident), hostmem.MiB(atReady.Footprint))
-			if settled.Footprint != 0 {
-				w("  vm helper, 2s after ready: %10s / %s", hostmem.MiB(settled.Resident), hostmem.MiB(settled.Footprint))
-			}
-		}
-		return b.String()
-	}
-
-	if *bench {
-		time.Sleep(2 * time.Second)
-		settled := memOf()
-		if err := m.Stop(); err != nil {
-			return fmt.Errorf("stop: %w", err)
-		}
-		if err := m.WaitStopped(10 * time.Second); err != nil {
-			return err
-		}
-		fmt.Fprint(os.Stderr, report(settled))
-		return nil
-	}
-
-	fmt.Fprint(os.Stderr, report(hostmem.Usage{}))
-	if err := m.WaitStopped(0); err != nil {
+	if err := g.m.WaitStopped(0); err != nil {
 		return err
 	}
-	if restore != nil {
-		restore()
-	}
-	fmt.Fprintln(os.Stderr, "\nthimble: vm stopped")
+	fmt.Fprintln(os.Stderr, "\r\nthimble: vm stopped")
 	return nil
 }
 
-func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
-
-// watchConsole copies guest output to stdout and signals the first byte and
-// the ready marker line.
-func watchConsole(r io.Reader, echo bool, firstByte chan<- time.Time, readyCh chan<- ready) {
-	var (
-		first   = true
-		seen    = false
-		lineBuf bytes.Buffer
-		buf     = make([]byte, 4096)
-	)
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			if first {
-				first = false
-				firstByte <- time.Now()
-			}
-			if echo {
-				os.Stdout.Write(buf[:n])
-			}
-			if !seen {
-				lineBuf.Write(buf[:n])
-				for {
-					line, rest, ok := bytes.Cut(lineBuf.Bytes(), []byte("\n"))
-					if !ok {
-						break
-					}
-					if i := bytes.Index(line, []byte(readyMarker)); i >= 0 {
-						seen = true
-						readyCh <- ready{at: time.Now(), line: strings.TrimRight(string(line[i:]), "\r")}
-						lineBuf.Reset()
-						break
-					}
-					lineBuf = *bytes.NewBuffer(append([]byte(nil), rest...))
-				}
-			}
-		}
-		if err != nil {
-			return
-		}
+// run boots a guest, waits for envd, and executes one command through
+// envd's process service, streaming stdout/stderr. This is the whole of
+// phase 2: it proves envd runs unchanged in the guest and that the vsock
+// path carries Connect RPC.
+func run(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	opts := guestFlags(fs)
+	showConsole := fs.Bool("console", false, "also show the guest console (kernel + /init output)")
+	user := fs.String("user", "user", "default user envd runs commands as")
+	cwd := fs.String("cwd", "/home/user", "default working directory")
+	keep := fs.Bool("keep", false, "leave the vm running after the command (Ctrl-C to stop)")
+	fs.Parse(args)
+	cmd := fs.Args()
+	if len(cmd) == 0 {
+		return fmt.Errorf("run: no command given (use: thimble run -- echo hello)")
 	}
+
+	g, err := launch(opts(*showConsole))
+	if err != nil {
+		return err
+	}
+	defer g.m.Stop()
+	stopOnSignal(g)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c := g.envdClient("")
+	if err := c.WaitHealthy(ctx); err != nil {
+		return err
+	}
+	tHealthy := time.Now()
+	hdr, err := c.Init(ctx, envd.InitRequest{DefaultUser: *user, DefaultWorkdir: *cwd})
+	if err != nil {
+		return err
+	}
+	tInit := time.Now()
+
+	var exit *int32
+	tStart := time.Now()
+	err = c.Start(ctx, envd.ProcessConfig{Cmd: cmd[0], Args: cmd[1:]}, func(ev envd.Event) {
+		switch {
+		case ev.Data != nil:
+			os.Stdout.Write(ev.Data.Stdout)
+			os.Stderr.Write(ev.Data.Stderr)
+		case ev.End != nil:
+			code := ev.End.ExitCode
+			exit = &code
+		}
+	})
+	if err != nil {
+		return err
+	}
+	tEnd := time.Now()
+
+	fmt.Fprint(os.Stderr, "\r\n--- thimble run report ---\r\n", g.bootReport())
+	fmt.Fprintf(os.Stderr, "envd healthy:       %8.1f ms  (vm.Start -> GET /health over vsock = 204; envd %s)\r\n", ms(tHealthy.Sub(g.t0)), hdr.Get("X-Envd-Version"))
+	fmt.Fprintf(os.Stderr, "envd initialised:   %8.1f ms  (POST /init: defaultUser=%s, took %.1f ms)\r\n", ms(tInit.Sub(g.t0)), *user, ms(tInit.Sub(tHealthy)))
+	fmt.Fprintf(os.Stderr, "process round trip: %8.1f ms  (process.Process/Start -> end event, exit %d)\r\n", ms(tEnd.Sub(tStart)), deref(exit))
+	fmt.Fprint(os.Stderr, g.memReport("after command"))
+	if *keep {
+		fmt.Fprintln(os.Stderr, "thimble: vm kept running, Ctrl-C to stop")
+		return g.m.WaitStopped(0)
+	}
+	if exit != nil && *exit != 0 {
+		os.Exit(int(*exit))
+	}
+	return nil
 }
 
-type ready struct {
-	at   time.Time
-	line string
+func deref(p *int32) int32 {
+	if p == nil {
+		return -1
+	}
+	return *p
+}
+
+func stopOnSignal(g *guest) {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() { <-sig; g.m.Stop() }()
 }
 
 // forwardStdin pumps keystrokes to the guest; Ctrl-] (0x1d, as in telnet)
@@ -264,13 +206,4 @@ func forwardStdin(w io.Writer, detach func()) {
 		}
 		w.Write([]byte{b})
 	}
-}
-
-func guestUptime(line string) string {
-	for _, f := range strings.Fields(line) {
-		if v, ok := strings.CutPrefix(f, "uptime="); ok {
-			return strings.TrimSuffix(v, "s")
-		}
-	}
-	return ""
 }

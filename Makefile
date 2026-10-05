@@ -45,10 +45,26 @@ $(KERNEL_APK):
 	@mkdir -p $(ALPINE_DIR)
 	curl -fsSL -o $@ $(MIRROR)/main/aarch64/$(notdir $@)
 
+# Guest userspace additions, layered over the Alpine minirootfs by mkimage.
+ENVD_SRC ?= ../runtime/packages/envd
+OVERLAY  := build/overlay
+ENVD     := $(OVERLAY)/usr/bin/envd
+VSOCKFWD := $(OVERLAY)/usr/bin/vsockfwd
+GUEST_GO := CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -buildvcs=false -ldflags "-s -w"
+
+# envd is E2B's agent, reused unchanged and cross-compiled for linux/arm64.
+$(ENVD): $(shell find $(ENVD_SRC) -name '*.go' -not -name '*_test.go' 2>/dev/null)
+	@mkdir -p $(dir $@)
+	cd $(ENVD_SRC) && $(GUEST_GO) -ldflags "-s -w -X=github.com/e2b-dev/infra/packages/envd/pkg.Version=0.9.0" -o $(abspath $@) .
+
+$(VSOCKFWD): cmd/vsockfwd/main.go
+	@mkdir -p $(dir $@)
+	$(GUEST_GO) -o $@ ./cmd/vsockfwd
+
 image: $(KERNEL) $(INITRD)
 
-$(KERNEL) $(INITRD): $(ROOTFS_TAR) $(KERNEL_APK) cmd/mkimage/main.go internal/cpio/writer.go
-	$(GO) run ./cmd/mkimage -rootfs $(ROOTFS_TAR) -kernel-apk $(KERNEL_APK) -out $(GUEST_DIR)
+$(KERNEL) $(INITRD): $(ROOTFS_TAR) $(KERNEL_APK) $(ENVD) $(VSOCKFWD) cmd/mkimage/main.go internal/cpio/writer.go
+	$(GO) run ./cmd/mkimage -rootfs $(ROOTFS_TAR) -kernel-apk $(KERNEL_APK) -overlay $(OVERLAY) -out $(GUEST_DIR)
 
 # Interactive: serial console on your terminal. Ctrl-] detaches and kills the VM.
 boot: build image
@@ -58,8 +74,12 @@ boot: build image
 bench: build image
 	./$(BIN) boot -kernel $(KERNEL) -initrd $(INITRD) -mem $(MEM) -cpus $(CPUS) -bench
 
+# Phase 2: boot, reach envd over vsock, run a command through its process service.
+run: build image
+	./$(BIN) run -kernel $(KERNEL) -initrd $(INITRD) -mem $(MEM) -cpus $(CPUS) -- $(or $(CMD),echo hello from envd)
+
 clean:
-	rm -rf bin $(GUEST_DIR)
+	rm -rf bin $(GUEST_DIR) $(OVERLAY)
 
 distclean: clean
 	rm -rf build
