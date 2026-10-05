@@ -2,6 +2,7 @@
 //
 //	thimble boot    phase 1: one guest with its serial console on the terminal
 //	thimble run     phase 2: run a command in a guest through envd over vsock
+//	thimble snapshot / restore  phase 3: save a booted guest, create N from it
 //	thimble limits  what the framework allows on this host
 package main
 
@@ -33,6 +34,10 @@ func main() {
 		err = boot(os.Args[2:])
 	case "run":
 		err = run(os.Args[2:])
+	case "snapshot":
+		err = snapshot(os.Args[2:])
+	case "restore":
+		err = restore(os.Args[2:])
 	case "limits":
 		minMem, maxMem, minCPU, maxCPU := vm.Limits()
 		fmt.Printf("memory: %s .. %s\ncpus:   %d .. %d\n", hostmem.MiB(minMem), hostmem.MiB(maxMem), minCPU, maxCPU)
@@ -50,6 +55,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   thimble boot   [-kernel K] [-initrd I] [-mem MiB] [-cpus N] [-cmdline S] [-bench]
   thimble run    [same flags] [-user U] [-cwd D] -- cmd [args...]
+  thimble snapshot [same flags] [-out DIR]
+  thimble restore  [-snapshot DIR] [-n 1,5,10] [-cmd S] [-keep]
   thimble limits`)
 }
 
@@ -189,6 +196,11 @@ func stopOnSignal(g *guest) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sig; g.m.Stop() }()
+}
+
+func waitSignal(sig chan os.Signal) {
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
 }
 
 // forwardStdin pumps keystrokes to the guest; Ctrl-] (0x1d, as in telnet)

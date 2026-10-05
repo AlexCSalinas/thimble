@@ -12,6 +12,7 @@ package vm
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -27,6 +28,16 @@ type Config struct {
 	CPUs      uint
 	MemoryMiB uint64
 
+	// MAC of the NAT network device. Random if empty. A restored VM must be
+	// configured identically to the one that was saved, MAC included, so
+	// snapshots record it.
+	MAC string
+
+	// MachineID is the generic platform machine identifier (opaque bytes from
+	// the framework). Random if nil. Like the MAC, a restore must present the
+	// identifier the state was saved under.
+	MachineID []byte
+
 	// ConsoleIn/ConsoleOut back the guest's hvc0. Either may be nil, in which
 	// case that direction is left unattached.
 	ConsoleIn, ConsoleOut *os.File
@@ -34,8 +45,15 @@ type Config struct {
 
 type Machine struct {
 	cfg Config
+	vmc *vz.VirtualMachineConfiguration
 	vm  *vz.VirtualMachine
 }
+
+// MAC returns the network device's MAC address as configured.
+func (m *Machine) MAC() string { return m.cfg.MAC }
+
+// MachineID returns the platform machine identifier bytes in use.
+func (m *Machine) MachineID() []byte { return m.cfg.MachineID }
 
 // Limits reports the framework's allowed memory range, which is what decides
 // how small a sandbox can be on this host.
@@ -65,6 +83,21 @@ func New(cfg Config) (*Machine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vm config: %w", err)
 	}
+
+	var mid *vz.GenericMachineIdentifier
+	if cfg.MachineID == nil {
+		if mid, err = vz.NewGenericMachineIdentifier(); err != nil {
+			return nil, err
+		}
+		cfg.MachineID = mid.DataRepresentation()
+	} else if mid, err = vz.NewGenericMachineIdentifierWithData(cfg.MachineID); err != nil {
+		return nil, fmt.Errorf("machine id: %w", err)
+	}
+	platform, err := vz.NewGenericPlatformConfiguration(vz.WithGenericMachineIdentifier(mid))
+	if err != nil {
+		return nil, err
+	}
+	vmc.SetPlatformVirtualMachineConfiguration(platform)
 
 	// Serial console -> hvc0 in the guest.
 	if cfg.ConsoleIn != nil || cfg.ConsoleOut != nil {
@@ -99,9 +132,20 @@ func New(cfg Config) (*Machine, error) {
 	if err != nil {
 		return nil, err
 	}
-	mac, err := vz.NewRandomLocallyAdministeredMACAddress()
-	if err != nil {
-		return nil, err
+	var mac *vz.MACAddress
+	if cfg.MAC == "" {
+		if mac, err = vz.NewRandomLocallyAdministeredMACAddress(); err != nil {
+			return nil, err
+		}
+		cfg.MAC = mac.String()
+	} else {
+		hw, err := net.ParseMAC(cfg.MAC)
+		if err != nil {
+			return nil, fmt.Errorf("mac %q: %w", cfg.MAC, err)
+		}
+		if mac, err = vz.NewMACAddress(hw); err != nil {
+			return nil, err
+		}
 	}
 	nic.SetMACAddress(mac)
 	vmc.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{nic})
@@ -131,7 +175,40 @@ func New(cfg Config) (*Machine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new vm: %w", err)
 	}
-	return &Machine{cfg: cfg, vm: m}, nil
+	return &Machine{cfg: cfg, vmc: vmc, vm: m}, nil
+}
+
+// ValidateSaveRestore reports whether this configuration can be saved and
+// restored at all. Not every device supports it.
+func (m *Machine) ValidateSaveRestore() error {
+	ok, err := m.vmc.ValidateSaveRestoreSupport()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("configuration does not support save/restore")
+	}
+	return nil
+}
+
+func (m *Machine) Pause() error  { return m.vm.Pause() }
+func (m *Machine) Resume() error { return m.vm.Resume() }
+
+// Save writes the paused VM's full state (memory + devices) to path.
+func (m *Machine) Save(path string) error {
+	if m.vm.State() != vz.VirtualMachineStatePaused {
+		if err := m.vm.Pause(); err != nil {
+			return fmt.Errorf("pause: %w", err)
+		}
+	}
+	return m.vm.SaveMachineStateToPath(path)
+}
+
+// Restore loads a saved state into this never-started VM, leaving it
+// paused. Call Resume to run it. The configuration must match the one the
+// state was saved from.
+func (m *Machine) Restore(path string) error {
+	return m.vm.RestoreMachineStateFromURL(path)
 }
 
 func (m *Machine) Start() error { return m.vm.Start() }
@@ -148,6 +225,29 @@ func (m *Machine) Balloon() *vz.VirtioTraditionalMemoryBalloonDevice {
 		return nil
 	}
 	return vz.AsVirtioTraditionalMemoryBalloonDevice(devs[0])
+}
+
+// SetMemoryTarget asks the guest, through the balloon, to shrink or grow to
+// bytes of usable RAM. Below the configured size the balloon inflates: the
+// guest hands free pages to the host, which unmaps them (footprint drops).
+// Back at the configured size the balloon deflates and the guest may touch
+// those pages again, lazily. Asynchronous; the guest's balloon driver does
+// the work.
+func (m *Machine) SetMemoryTarget(bytes uint64) error {
+	b := m.Balloon()
+	if b == nil {
+		return errors.New("vm has no balloon device")
+	}
+	b.SetTargetVirtualMachineMemorySize(bytes)
+	return nil
+}
+
+// MemoryTarget reports the balloon's current target.
+func (m *Machine) MemoryTarget() uint64 {
+	if b := m.Balloon(); b != nil {
+		return b.GetTargetVirtualMachineMemorySize()
+	}
+	return 0
 }
 
 // Vsock returns the virtio socket device for host->guest connections.

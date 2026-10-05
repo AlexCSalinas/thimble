@@ -78,8 +78,16 @@ bench: build image
 run: build image
 	./$(BIN) run -kernel $(KERNEL) -initrd $(INITRD) -mem $(MEM) -cpus $(CPUS) -- $(or $(CMD),echo hello from envd)
 
+# Phase 3: save a booted, envd-ready guest; then create sandboxes by restoring it.
+SNAP ?= build/snap
+snapshot: build image
+	./$(BIN) snapshot -kernel $(KERNEL) -initrd $(INITRD) -mem $(MEM) -cpus $(CPUS) -out $(SNAP)
+
+restore: build
+	./$(BIN) restore -snapshot $(SNAP) -n $(or $(N),1,5,10)
+
 clean:
-	rm -rf bin $(GUEST_DIR) $(OVERLAY)
+	rm -rf bin $(GUEST_DIR) $(OVERLAY) $(SNAP)
 
 distclean: clean
 	rm -rf build

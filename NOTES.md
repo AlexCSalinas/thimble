@@ -181,3 +181,115 @@ Other envd facts that shape phase 2:
   `defaultWorkdir`, `timestamp`; expects 204. `GET /health` expects 204.
 - Services are Connect RPC with JSON codec: `/process.Process/Start`
   (server stream), `/filesystem.Filesystem/*`.
+
+## Phase 2: envd over vsock
+
+Measured (3 runs): userspace ready 480 to 590 ms after `Start`, envd
+healthy 15 to 30 ms after that, `echo hello` round trip through
+`process.Process/Start` 1.9 ms, helper footprint 132 MiB. Boot got slower than
+phase 1 because the initramfs doubled (envd is a 10 MiB static binary) and the
+guest's own clock went from 90 to 240 ms; the kernel inflates and unpacks the
+cpio before `/init` runs. A block-device rootfs would avoid that (phase 3+).
+
+### Reusing envd unchanged
+
+envd is cross-compiled from `../runtime/packages/envd` with
+`CGO_ENABLED=0 GOOS=linux GOARCH=arm64`, the same recipe as E2B's Makefile. It
+runs as root (it switches uid per request via `SysProcAttr.Credential`) with
+`-isnotfc` (do not poll Firecracker's MMDS for config) and `-no-cgroups`. The
+guest gets a `user` account at boot, and `POST /init` sets `defaultUser=user`,
+`defaultWorkdir=/home/user`, which is what E2B's orchestrator sends.
+
+### vsock, with a forwarder
+
+E2B never uses vsock. The orchestrator talks plain HTTP to
+`http://<slot ip>:49983` over a veth pair into the sandbox's network
+namespace. Here the host has no such address (NAT assigns one by DHCP, which
+would need discovery), while vsock is addressable the moment the VM exists.
+envd only listens on TCP, so `cmd/vsockfwd` runs in the guest: it binds
+`AF_VSOCK` port 49983 and splices each connection to `127.0.0.1:49983`. It is
+written against raw syscalls because `net` has no vsock support and `syscall`
+has no `SockaddrVM` (the struct is 16 bytes, easy to hand-roll). On the host,
+`internal/envd` is an `http.Client` whose `DialContext` returns
+`VirtioSocketDevice.Connect(49983)`.
+
+### Connect RPC by hand
+
+envd's services use the Connect protocol. With the JSON codec a server-stream
+call is just `POST /process.Process/Start` with
+`Content-Type: application/connect+json`, a request body of one envelope
+(1 flag byte, 4-byte big-endian length, JSON), and a chunked response of
+envelopes where flag `0x02` marks the trailer carrying `{"error": ...}`. That
+is ~60 lines in `internal/envd/client.go` and avoids pulling in
+`connectrpc.com/connect` and protobuf. Event JSON is proto3 JSON: `exitCode`,
+bytes as base64, which `encoding/json` decodes into `[]byte` directly.
+
+## Phase 3: snapshot and restore
+
+"Create sandbox" is now: build a VM with the saved configuration, restore the
+state file, resume, reconnect to envd, re-run `/init` so the guest clock is
+corrected. That is E2B's model too: `ResumeSandbox` loads a Firecracker
+snapshot and then `WaitForEnvd` posts `/init`.
+
+### What must match
+
+`restoreMachineStateFromURL` rejects the file with a bare "invalid argument"
+unless the VM configuration is identical to the one saved. Two things are
+random per configuration by default and therefore have to be recorded in
+`snapshot.json`: the network device's MAC and the generic platform's machine
+identifier (`VZGenericMachineIdentifier`, opaque bytes). The state file also
+cannot be overwritten; `snapshot` removes the old one first.
+
+### Measurements (`make restore`, `-idle 96`)
+
+| N  | restore (first .. last) | envd healthy after restore | total helper footprint | per sandbox |
+|----|-------------------------|----------------------------|------------------------|-------------|
+| 1  | 240 to 360 ms           | +3 ms                      | 206 MiB                | 206 MiB     |
+| 5  | 244 to 318 ms           | +3 ms                      | 1035 MiB               | 207 MiB     |
+| 10 | 242 to 520 ms           | +3 to +7 ms                | 1471 MiB               | 147 MiB     |
+
+The state file is 23 MiB: the framework stores touched pages, compressed.
+Restore beats cold boot by about 2x (260 vs 550 ms to a healthy envd) and the
+guest does no work at all: envd answers 3 ms after `Resume`. Restore latency
+climbs with N as host memory fills; the tenth restore takes twice the first.
+
+### Why a restored sandbox costs 2.5x a booted one, and the balloon
+
+A cold-booted guest costs 132 MiB because the host only backs pages the guest
+has touched. A restored guest costs 355 to 367 MiB: restore writes every one
+of the 256 MiB guest pages, zero or not, and macOS has no equivalent of the
+lazy page-in E2B gets from userfaultfd (`pkg/sandbox/uffd`), where a page is
+only materialised when the guest faults on it.
+
+The only lever on macOS is the virtio balloon. Experiment, one restored
+sandbox, footprint sampled for 6 s:
+
+| strategy                                   | footprint |
+|--------------------------------------------|-----------|
+| restore only                               | 367 MiB   |
+| inflate balloon to 64 MiB, keep inflated   | 211 MiB   |
+| inflate to 64 MiB, then deflate to 256 MiB | 537 MiB   |
+
+Inflating works: the guest hands its free pages to the balloon, the host
+unmaps them. Deflating is worse than never inflating, by 170 MiB; the
+framework appears to repopulate the returned range eagerly. So the policy is
+"inflate after restore and stay inflated" (`restore -idle 96`, default).
+`-idle` is the memory the guest keeps, not the balloon size. 96 MiB leaves
+envd room; raise it per sandbox when a workload needs more and accept the
+one-time cost. E2B avoids this dance with free page reporting
+(`pkg/sandbox/balloon_mode.go`), a newer balloon feature where the guest
+reports freed pages continuously; Apple's "traditional" balloon device does
+not offer it.
+
+At N=10 the per-sandbox number drops to 147 MiB because macOS starts
+compressing the helpers' idle pages; `phys_footprint` counts compressed pages
+at their compressed size.
+
+### Still an initramfs
+
+Every restored sandbox shares the one state file and has its rootfs in RAM.
+No per-sandbox disk, no COW, no NBD. E2B's rootfs path (`pkg/sandbox/rootfs`,
+`pkg/sandbox/nbd`) exists because templates are gigabytes and sandboxes write
+to them. Here the rootfs is 20 MiB and writes land in tmpfs, counted against
+the sandbox's memory. The APFS `clonefile` design from phase 1 is still the
+plan if a disk is ever needed; it was not needed for any phase.
