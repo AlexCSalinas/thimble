@@ -1,0 +1,65 @@
+# thimble: tiny Linux microVMs on Apple Silicon via Virtualization.framework.
+#
+# The one non-obvious step is codesigning. Virtualization.framework refuses to
+# start a VM from a binary that lacks the com.apple.security.virtualization
+# entitlement, and `go build` produces an unsigned binary. An ad-hoc signature
+# (`-s -`) carrying entitlements.plist is enough; no developer account needed.
+# This also means `go run ./cmd/thimble` can never work. Use `make boot`.
+
+GO      ?= go
+BIN     := bin/thimble
+ALPINE_VERSION := 3.22
+ALPINE_RELEASE := 3.22.6
+KERNEL_PKG     := linux-virt-6.12.111-r0
+MIRROR  := https://dl-cdn.alpinelinux.org/alpine/v$(ALPINE_VERSION)
+
+ALPINE_DIR := build/alpine
+ROOTFS_TAR := $(ALPINE_DIR)/alpine-minirootfs-$(ALPINE_RELEASE)-aarch64.tar.gz
+KERNEL_APK := $(ALPINE_DIR)/$(KERNEL_PKG).apk
+GUEST_DIR  := build/guest
+KERNEL     := $(GUEST_DIR)/vmlinux
+INITRD     := $(GUEST_DIR)/initramfs.cpio.gz
+
+MEM  ?= 256
+CPUS ?= 1
+
+.PHONY: all build image fetch boot bench clean distclean
+
+all: build image
+
+build: $(BIN)
+
+$(BIN): $(shell find cmd internal -name '*.go') go.mod go.sum entitlements.plist
+	@mkdir -p bin
+	$(GO) build -o $@ ./cmd/thimble
+	codesign --force --sign - --entitlements entitlements.plist $@
+	@codesign -d --entitlements - $@ 2>&1 | grep -q com.apple.security.virtualization && echo "signed: $@ (ad-hoc, virtualization entitlement)"
+
+fetch: $(ROOTFS_TAR) $(KERNEL_APK)
+
+$(ROOTFS_TAR):
+	@mkdir -p $(ALPINE_DIR)
+	curl -fsSL -o $@ $(MIRROR)/releases/aarch64/$(notdir $@)
+
+$(KERNEL_APK):
+	@mkdir -p $(ALPINE_DIR)
+	curl -fsSL -o $@ $(MIRROR)/main/aarch64/$(notdir $@)
+
+image: $(KERNEL) $(INITRD)
+
+$(KERNEL) $(INITRD): $(ROOTFS_TAR) $(KERNEL_APK) cmd/mkimage/main.go internal/cpio/writer.go
+	$(GO) run ./cmd/mkimage -rootfs $(ROOTFS_TAR) -kernel-apk $(KERNEL_APK) -out $(GUEST_DIR)
+
+# Interactive: serial console on your terminal. Ctrl-] detaches and kills the VM.
+boot: build image
+	./$(BIN) boot -kernel $(KERNEL) -initrd $(INITRD) -mem $(MEM) -cpus $(CPUS)
+
+# Non-interactive: boot, wait for the ready marker, print timings and memory, stop.
+bench: build image
+	./$(BIN) boot -kernel $(KERNEL) -initrd $(INITRD) -mem $(MEM) -cpus $(CPUS) -bench
+
+clean:
+	rm -rf bin $(GUEST_DIR)
+
+distclean: clean
+	rm -rf build
