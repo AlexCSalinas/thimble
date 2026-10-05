@@ -23,7 +23,7 @@ INITRD     := $(GUEST_DIR)/initramfs.cpio.gz
 MEM  ?= 256
 CPUS ?= 1
 
-.PHONY: all build image fetch boot bench clean distclean
+.PHONY: all build image fetch boot bench run snapshot restore serve sdk-venv sdk-test clean distclean
 
 all: build image
 
@@ -41,10 +41,6 @@ $(ROOTFS_TAR):
 	@mkdir -p $(ALPINE_DIR)
 	curl -fsSL -o $@ $(MIRROR)/releases/aarch64/$(notdir $@)
 
-$(KERNEL_APK):
-	@mkdir -p $(ALPINE_DIR)
-	curl -fsSL -o $@ $(MIRROR)/main/aarch64/$(notdir $@)
-
 # Guest userspace additions, layered over the Alpine minirootfs by mkimage.
 ENVD_SRC ?= ../runtime/packages/envd
 OVERLAY  := build/overlay
@@ -61,10 +57,22 @@ $(VSOCKFWD): cmd/vsockfwd/main.go
 	@mkdir -p $(dir $@)
 	$(GUEST_GO) -o $@ ./cmd/vsockfwd
 
+# Extra Alpine packages unpacked into the rootfs. bash is non-negotiable: the
+# E2B SDKs run every command as `/bin/bash -l -c`. Each is a plain tarball;
+# mkimage unpacks them without apk (no install scripts, fine for these).
+EXTRA_PKGS := bash-5.2.37-r0 readline-8.2.13-r1 libncursesw-6.5_p20250503-r0 ncurses-terminfo-base-6.5_p20250503-r0
+EXTRA_APKS := $(addprefix $(ALPINE_DIR)/,$(addsuffix .apk,$(EXTRA_PKGS)))
+
+$(ALPINE_DIR)/%.apk:
+	@mkdir -p $(ALPINE_DIR)
+	curl -fsSL -o $@ $(MIRROR)/main/aarch64/$(notdir $@)
+
 image: $(KERNEL) $(INITRD)
 
-$(KERNEL) $(INITRD): $(ROOTFS_TAR) $(KERNEL_APK) $(ENVD) $(VSOCKFWD) cmd/mkimage/main.go internal/cpio/writer.go
-	$(GO) run ./cmd/mkimage -rootfs $(ROOTFS_TAR) -kernel-apk $(KERNEL_APK) -overlay $(OVERLAY) -out $(GUEST_DIR)
+$(KERNEL) $(INITRD): $(ROOTFS_TAR) $(KERNEL_APK) $(EXTRA_APKS) $(ENVD) $(VSOCKFWD) cmd/mkimage/main.go internal/cpio/writer.go
+	$(GO) run ./cmd/mkimage -rootfs $(ROOTFS_TAR) -kernel-apk $(KERNEL_APK) -overlay $(OVERLAY) -out $(GUEST_DIR) \
+		-apks $(subst $(eval) ,$(comma),$(EXTRA_APKS))
+comma := ,
 
 # Interactive: serial console on your terminal. Ctrl-] detaches and kills the VM.
 boot: build image
@@ -85,6 +93,24 @@ snapshot: build image
 
 restore: build
 	./$(BIN) restore -snapshot $(SNAP) -n $(or $(N),1,5,10)
+
+# Phase 4+5: the E2B-compatible control plane. Point the stock SDK at it:
+#   E2B_API_KEY=anything E2B_API_URL=http://localhost:3000 E2B_SANDBOX_URL=http://localhost:49983
+serve: build
+	./$(BIN) serve -snapshot $(SNAP)
+
+# Run the E2B Python SDK's sandbox tests against a running `make serve`.
+# Needs a venv with the SDK: make sdk-venv (uses python3.13 from Homebrew).
+E2B_SDK ?= ../E2B/packages/python-sdk
+VENV    := build/venv
+sdk-venv:
+	python3.13 -m venv $(VENV)
+	$(VENV)/bin/pip install -q -e $(E2B_SDK) 'pytest>=9,<10' 'pytest-asyncio>=1.3,<2' 'pytest-timeout>=2.4,<3' 'pytest-xdist>=3.3,<4' 'pytest-dotenv>=0.5.2,<0.6'
+
+SDK_TESTS ?= tests/sync/sandbox_sync/test_create.py tests/sync/sandbox_sync/test_connect.py tests/sync/sandbox_sync/test_kill.py tests/sync/sandbox_sync/test_timeout.py tests/sync/sandbox_sync/commands tests/sync/sandbox_sync/files
+sdk-test:
+	cd $(E2B_SDK) && env -u E2B_DEBUG E2B_API_KEY=test E2B_API_URL=http://localhost:3000 E2B_SANDBOX_URL=http://localhost:49983 \
+		$(abspath $(VENV))/bin/python -m pytest -p no:cacheprovider --timeout 120 -q -rfE $(SDK_TESTS)
 
 clean:
 	rm -rf bin $(GUEST_DIR) $(OVERLAY) $(SNAP)

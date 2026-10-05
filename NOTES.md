@@ -293,3 +293,134 @@ No per-sandbox disk, no COW, no NBD. E2B's rootfs path (`pkg/sandbox/rootfs`,
 to them. Here the rootfs is 20 MiB and writes land in tmpfs, counted against
 the sandbox's memory. The APFS `clonefile` design from phase 1 is still the
 plan if a disk is ever needed; it was not needed for any phase.
+
+## Phase 4: the E2B control plane, enough of it
+
+`thimble serve` runs two listeners: the control plane on `:3000` and an envd
+proxy on `:49983`. The stock Python SDK (`e2b` 2.51.0, unmodified) is pointed
+at it with three environment variables and nothing else:
+
+```sh
+E2B_API_KEY=anything            # required by the SDK; thimble accepts any non-empty key unless -api-key is set
+E2B_API_URL=http://localhost:3000
+E2B_SANDBOX_URL=http://localhost:49983
+```
+
+### What the SDK actually needs
+
+Read from `spec/openapi.yml` and the SDK's generated client:
+
+| SDK call               | HTTP                                   | thimble                                   |
+|------------------------|----------------------------------------|-------------------------------------------|
+| `Sandbox.create`       | `POST /v2/sandboxes` -> 201 `Sandbox`  | restore snapshot, `/init` with fresh token|
+| `Sandbox.connect`      | `POST /v2/sandboxes/{id}/connect`      | 200 if running (TTL only extended), 201 if resumed |
+| `kill`                 | `DELETE /sandboxes/{id}` -> 204/404    | stop VM, forget                           |
+| `Sandbox.list`         | `GET /v2/sandboxes?metadata=&state=`   | filter the in-memory table                |
+| `set_timeout`          | `POST /sandboxes/{id}/timeout` -> 204  | reset a `time.AfterFunc`                  |
+| `get_info`             | `GET /sandboxes/{id}` -> `SandboxDetail`| `endAt`, `state`, `metadata`, sizes      |
+| `pause`                | `POST /sandboxes/{id}/pause` -> 204    | phase 5                                   |
+| `is_running`           | `GET /health` on the **sandbox** URL   | proxied to envd; 502 when not running     |
+
+Auth is the `X-API-Key` header. `clientID` is deprecated in the spec and
+returned as a constant. `envdAccessToken` is generated per sandbox and handed
+to envd in `/init`; envd itself then rejects requests without the matching
+`X-Access-Token`, so the proxy does no auth of its own.
+
+### Routing without hostnames
+
+E2B reaches a sandbox at `https://49983-<id>.<domain>` (or the stable
+`https://sandbox.<domain>` with routing headers). Both need DNS and TLS,
+which a laptop does not have. `E2B_SANDBOX_URL` makes the SDK send all envd
+traffic to one base URL, and because the SDK attaches `E2b-Sandbox-Id` to
+every envd request (`sandbox_sync/main.py`), the proxy can route on that
+header to the right VM's vsock. Each sandbox owns an `http.Transport` whose
+dialer is its `VirtioSocketDevice.Connect`. `httputil.ReverseProxy` with
+`FlushInterval: -1` carries Connect streams unbuffered. Header-less requests
+(signed download URLs opened with `urllib`) fall back to "the only running
+sandbox", which is the one thing a single shared URL cannot express.
+
+### Two things the guest image had to grow
+
+- `/bin/bash`: the SDK runs every command as `/bin/bash -l -c`. Alpine's
+  bash plus readline, libncursesw and terminfo are unpacked from their apk
+  tarballs by `mkimage -apks`, no package manager involved.
+- `chmod 0755 /home/user`: busybox `adduser` creates the home with mode
+  `02755`; every directory created under it inherited setgid and envd's
+  `ListDir` reported `dgrwxr-xr-x`, failing two files tests.
+
+### A killed sandbox mid-stream
+
+When a sandbox is killed while a command is streaming, the upstream vsock
+connection dies and `ReverseProxy` would reset the client. E2B's proxy
+instead emits a Connect end-of-stream envelope with code `unavailable` at
+the next frame boundary, which the SDK maps to a `TimeoutException`
+explaining the sandbox is gone. `eofOnError` in `internal/api` does the
+same.
+
+### Test results (`make sdk-test`)
+
+Against `tests/sync/sandbox_sync/` and `tests/async/sandbox_async/`:
+
+| suite                              | passed | failed | why the failures are not fixable here |
+|------------------------------------|--------|--------|---------------------------------------|
+| sync test_create/connect/kill/timeout | 27  | 2      | see below                             |
+| async test_create/connect/kill/timeout| 27  | 2      | same two                              |
+| sync commands/ + files/            | 82     | 3      | guest has no `sudo`, no `python3`     |
+
+Skipped / failing, and why:
+
+- `test_auto_pause_filesystem_only_reboots`: `keep_memory=False` means "drop
+  memory, cold-boot from disk on resume". thimble has no per-sandbox disk;
+  the rootfs is an initramfs, so a cold boot would lose the files the test
+  checks. Needs the virtio-blk + clonefile design.
+- `test_auto_resume_wakes_on_http_request`: expects a public
+  `https://8000-<id>.e2b.app` URL to wake a paused sandbox. Needs an ingress
+  with DNS and TLS that resumes on first packet. Out of scope.
+- `test_bash_command_scoped_env_vars`, `test_python_command_scoped_env_vars`,
+  `test_metadata_set_via_xattrs_surfaced_in_get_info`: run `sudo` or
+  `python3`. `sudo` is in Alpine's community repo and needs sudoers setup;
+  `python3` is 35 MiB that would sit in guest RAM for every sandbox with the
+  initramfs design. Both are `mkimage -apks` additions once there is a disk.
+- `test_host.py` (`get_host(port)` to a `https://8001-<id>.<domain>` URL):
+  not run, same ingress reason.
+
+### What E2B has that this does not
+
+Templates (every create restores the one snapshot; `templateID` is
+recorded, not resolved), teams and auth, Postgres/Redis state, metrics,
+volumes, MCP gateway, network policies, the orchestrator/API split over
+gRPC, and the proxies that make `49983-<id>.e2b.app` resolve to the right
+host. The shape is the same; the table is a Go map.
+
+## Phase 5: pause and resume
+
+`POST /sandboxes/{id}/pause` does: stop the TTL timer, `Pause` the VM,
+`SaveMachineStateToPath` into `build/snap/paused/<id>/`, `Stop` the VM. The
+helper process exits, so a paused sandbox costs zero host memory, not "less".
+`connect` on a paused sandbox restores that file into a fresh VM (same MAC
+and machine id, recorded on the sandbox), resumes, waits for envd, re-posts
+`/init` with the same access token (envd accepts a matching token), re-arms
+the TTL, and answers 201. `autoPause` on create makes TTL expiry pause
+instead of kill, which is how the SDK's `lifecycle={"on_timeout": "pause"}`
+tests passed, including the one that checks `boot_id` is unchanged across
+the pause (it is: this is a memory restore, not a reboot).
+
+From the server log for one sandbox:
+
+```
+create  took 354 ms  footprint 356 MiB
+pause   footprint 300 MiB -> 0 (helper exited), state file 24 MiB, took 331 ms
+resume  took 249 ms  footprint 353 MiB
+```
+
+Where the balloon comes in: the sandbox has been running with the balloon
+inflated to `-idle` since it was created, so at pause time the guest's free
+pages are already with the host and the state file holds only what is in
+use (24 MiB for a 256 MiB guest). After resume the balloon is inflated again
+before the sandbox is handed back. E2B's pause (`sandbox.go Pause`) is a
+much longer sequence for the same idea: freeze cgroups, `fstrim`, `sync`,
+drop caches, drain the free-page-hinting balloon, then snapshot, then diff
+the memory file against the template so only changed pages are uploaded. It
+has to be, because its snapshots go to object storage and are restored on
+another machine; thimble's go to a local directory and come back on the
+same one.

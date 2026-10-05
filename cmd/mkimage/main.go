@@ -47,18 +47,23 @@ func main() {
 		kernelApk = flag.String("kernel-apk", "", "path to linux-virt-*.apk")
 		outDir    = flag.String("out", "build/guest", "output directory")
 		extraDir  = flag.String("overlay", "", "optional directory copied over the rootfs (files become root-owned, mode preserved)")
+		apks      = flag.String("apks", "", "comma-separated extra Alpine .apk files to unpack into the rootfs (no install scripts run)")
 	)
 	flag.Parse()
 	if *rootfsTar == "" || *kernelApk == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(*rootfsTar, *kernelApk, *outDir, *extraDir); err != nil {
+	var extra []string
+	if *apks != "" {
+		extra = strings.Split(*apks, ",")
+	}
+	if err := run(*rootfsTar, *kernelApk, *outDir, *extraDir, extra); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(rootfsTar, kernelApk, outDir, overlay string) error {
+func run(rootfsTar, kernelApk, outDir, overlay string, apks []string) error {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
@@ -96,6 +101,16 @@ func run(rootfsTar, kernelApk, outDir, overlay string) error {
 	modDir := "lib/modules/" + kver
 	if err := extractModules(kernelApk, modDir, order, cw); err != nil {
 		return fmt.Errorf("modules: %w", err)
+	}
+
+	// Extra packages are plain tar members; apk's install scripts and
+	// triggers are skipped, which is fine for leaf packages like bash.
+	for _, a := range apks {
+		n, err := unpackApk(a, cw)
+		if err != nil {
+			return fmt.Errorf("%s: %w", a, err)
+		}
+		log.Printf("apk: %d entries from %s", n, filepath.Base(a))
 	}
 
 	if err := cw.FileBytes("init", 0o755, initScript(modDir, order)); err != nil {
@@ -318,6 +333,45 @@ func copyTarIntoCpio(p string, cw *cpio.Writer) (int, error) {
 	}
 }
 
+// unpackApk adds a package's files to the archive, skipping apk's own
+// metadata (.SIGN.*, .PKGINFO, .pre-install and friends at the root).
+func unpackApk(p string, cw *cpio.Writer) (int, error) {
+	tr, closeFn, err := openApk(p)
+	if err != nil {
+		return 0, err
+	}
+	defer closeFn()
+	n := 0
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+		name := strings.TrimPrefix(h.Name, "./")
+		if name == "" || name == "." || strings.HasPrefix(name, ".") {
+			continue
+		}
+		perm := uint32(h.Mode) & 0o7777
+		switch h.Typeflag {
+		case tar.TypeDir:
+			err = cw.Dir(name, perm)
+		case tar.TypeSymlink:
+			err = cw.Symlink(name, h.Linkname)
+		case tar.TypeReg:
+			err = cw.File(name, perm, h.Size, tr)
+		default:
+			continue
+		}
+		if err != nil {
+			return n, err
+		}
+		n++
+	}
+}
+
 func copyDirIntoCpio(dir string, cw *cpio.Writer) (int, error) {
 	n := 0
 	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
@@ -458,6 +512,7 @@ trap 'sync; halt -f'     USR1
 if [ -x /usr/bin/envd ]; then
     adduser -D -u 1000 -s /bin/sh -h /home/user user 2>/dev/null
     mkdir -p /home/user && chown user:user /home/user
+    chmod 0755 /home/user   # busybox adduser sets 02755; the setgid bit would be inherited by every subdir
     ( while :; do /usr/bin/envd -isnotfc -no-cgroups >>/run/envd.log 2>&1; sleep 1; done ) &
     ( while :; do /usr/bin/vsockfwd 49983 127.0.0.1:49983 >>/run/vsockfwd.log 2>&1; sleep 1; done ) &
 fi

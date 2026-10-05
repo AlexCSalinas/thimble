@@ -3,6 +3,7 @@
 //	thimble boot    phase 1: one guest with its serial console on the terminal
 //	thimble run     phase 2: run a command in a guest through envd over vsock
 //	thimble snapshot / restore  phase 3: save a booted guest, create N from it
+//	thimble serve   phase 4+5: E2B-compatible API + envd proxy, pause/resume
 //	thimble limits  what the framework allows on this host
 package main
 
@@ -35,9 +36,11 @@ func main() {
 	case "run":
 		err = run(os.Args[2:])
 	case "snapshot":
-		err = snapshot(os.Args[2:])
+		err = snapshotCmd(os.Args[2:])
 	case "restore":
 		err = restore(os.Args[2:])
+	case "serve":
+		err = serve(os.Args[2:])
 	case "limits":
 		minMem, maxMem, minCPU, maxCPU := vm.Limits()
 		fmt.Printf("memory: %s .. %s\ncpus:   %d .. %d\n", hostmem.MiB(minMem), hostmem.MiB(maxMem), minCPU, maxCPU)
@@ -57,6 +60,7 @@ func usage() {
   thimble run    [same flags] [-user U] [-cwd D] -- cmd [args...]
   thimble snapshot [same flags] [-out DIR]
   thimble restore  [-snapshot DIR] [-n 1,5,10] [-cmd S] [-keep]
+  thimble serve    [-snapshot DIR] [-api ADDR] [-envd ADDR] [-idle MiB] [-api-key K]
   thimble limits`)
 }
 

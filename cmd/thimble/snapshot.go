@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -14,25 +13,9 @@ import (
 
 	"github.com/alexcsalinas/thimble/internal/envd"
 	"github.com/alexcsalinas/thimble/internal/hostmem"
+	"github.com/alexcsalinas/thimble/internal/snapshot"
 	"github.com/alexcsalinas/thimble/internal/vm"
 )
-
-// snapshotMeta is written next to the saved machine state. A restore must
-// build a VM with exactly this configuration or the framework rejects the
-// file, so everything that went into vm.Config is recorded.
-type snapshotMeta struct {
-	Kernel      string    `json:"kernel"`
-	Initrd      string    `json:"initrd"`
-	Cmdline     string    `json:"cmdline"`
-	MemMiB      uint64    `json:"memMiB"`
-	CPUs        uint      `json:"cpus"`
-	MAC         string    `json:"mac"`
-	MachineID   []byte    `json:"machineId"`
-	EnvdVersion string    `json:"envdVersion"`
-	Created     time.Time `json:"created"`
-}
-
-const stateFile = "state.vzvmstate"
 
 var keepInflated bool
 
@@ -40,7 +23,7 @@ var keepInflated bool
 // its memory and device state. This is the template "build" step: E2B does
 // the same with Firecracker's snapshot API after the template's envd is up,
 // and every later sandbox is a resume of that file.
-func snapshot(args []string) error {
+func snapshotCmd(args []string) error {
 	fs := flag.NewFlagSet("snapshot", flag.ExitOnError)
 	opts := guestFlags(fs)
 	out := fs.String("out", "build/snap", "directory to write the snapshot into")
@@ -73,7 +56,7 @@ func snapshot(args []string) error {
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		return err
 	}
-	path, _ := filepath.Abs(filepath.Join(*out, stateFile))
+	path, _ := filepath.Abs(filepath.Join(*out, snapshot.StateFile))
 	os.Remove(path) // the framework refuses to overwrite
 	tPause := time.Now()
 	if err := g.m.Pause(); err != nil {
@@ -86,13 +69,12 @@ func snapshot(args []string) error {
 	tSaved := time.Now()
 
 	abs := func(p string) string { a, _ := filepath.Abs(p); return a }
-	meta := snapshotMeta{
+	meta := snapshot.Meta{
 		Kernel: abs(o.kernel), Initrd: abs(o.initrd), Cmdline: o.cmdline,
 		MemMiB: o.mem, CPUs: o.cpus, MAC: g.m.MAC(), MachineID: g.m.MachineID(),
 		EnvdVersion: hdr.Get("X-Envd-Version"), Created: time.Now(),
 	}
-	mb, _ := json.MarshalIndent(meta, "", "  ")
-	if err := os.WriteFile(filepath.Join(*out, "snapshot.json"), mb, 0o644); err != nil {
+	if err := meta.Save(*out); err != nil {
 		return err
 	}
 	st, _ := os.Stat(path)
@@ -132,15 +114,10 @@ func restore(args []string) error {
 	fs.Parse(args)
 	keepInflated = !*deflate
 
-	mb, err := os.ReadFile(filepath.Join(*dir, "snapshot.json"))
+	meta, state, err := snapshot.Load(*dir)
 	if err != nil {
 		return err
 	}
-	var meta snapshotMeta
-	if err := json.Unmarshal(mb, &meta); err != nil {
-		return err
-	}
-	state, _ := filepath.Abs(filepath.Join(*dir, stateFile))
 
 	var groups []int
 	for _, s := range strings.Split(*ns, ",") {
@@ -206,7 +183,7 @@ func restore(args []string) error {
 	return nil
 }
 
-func restoreOne(meta snapshotMeta, state, cmd string, squeezeMiB uint64) (*restored, error) {
+func restoreOne(meta snapshot.Meta, state, cmd string, squeezeMiB uint64) (*restored, error) {
 	outR, outW, err := os.Pipe()
 	if err != nil {
 		return nil, err
