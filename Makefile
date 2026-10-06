@@ -18,14 +18,33 @@ ROOTFS_TAR := $(ALPINE_DIR)/alpine-minirootfs-$(ALPINE_RELEASE)-aarch64.tar.gz
 KERNEL_APK := $(ALPINE_DIR)/$(KERNEL_PKG).apk
 GUEST_DIR  := build/guest
 KERNEL     := $(GUEST_DIR)/vmlinux
-INITRD     := $(GUEST_DIR)/initramfs.cpio.gz
+# Full guest in RAM (boot/run/snapshot/mkdisk); boot initramfs (modules +
+# switch_root, for disk-backed sandboxes); template root disk (sandboxes boot
+# APFS clones of it). Comments stay on their own lines: make keeps the
+# whitespace before an inline comment as part of the value.
+INITRD      := $(GUEST_DIR)/initramfs.cpio.gz
+BOOT_INITRD := $(GUEST_DIR)/boot.cpio.gz
+ROOTFS_IMG  := $(GUEST_DIR)/rootfs.img
 
 MEM  ?= 256
 CPUS ?= 1
 
-.PHONY: all build image fetch boot bench run snapshot restore serve sdk-venv sdk-test clean distclean
+# Template disk: size is sparse (only written blocks cost space), packages are
+# installed by apk inside the guest. Change GUEST_PKGS, then `make disk` after
+# removing build/guest/rootfs.img.
+DISK_MB     ?= 4096
+SANDBOX_MEM ?= 512
+# E2B_API_URL=http://localhost:$(API_PORT), E2B_SANDBOX_URL=http://localhost:$(ENVD_PORT)
+API_PORT    ?= 3000
+ENVD_PORT   ?= 49983
+SDK_ENV      = E2B_API_KEY=test E2B_API_URL=http://localhost:$(API_PORT) E2B_SANDBOX_URL=http://localhost:$(ENVD_PORT)
+GUEST_PKGS  ?= bash coreutils findutils grep sed gawk diffutils tar gzip xz procps-ng \
+               ca-certificates curl wget git openssh-client python3 py3-pip nodejs npm \
+               sudo jq less file make
 
-all: build image
+.PHONY: all build image disk fetch boot bench run snapshot restore serve smoke sdk-venv sdk-test clean distclean
+
+all: build image disk
 
 build: $(BIN)
 
@@ -67,9 +86,9 @@ $(ALPINE_DIR)/%.apk:
 	@mkdir -p $(ALPINE_DIR)
 	curl -fsSL -o $@ $(MIRROR)/main/aarch64/$(notdir $@)
 
-image: $(KERNEL) $(INITRD)
+image: $(KERNEL) $(INITRD) $(BOOT_INITRD)
 
-$(KERNEL) $(INITRD): $(ROOTFS_TAR) $(KERNEL_APK) $(EXTRA_APKS) $(ENVD) $(VSOCKFWD) cmd/mkimage/main.go internal/cpio/writer.go
+$(KERNEL) $(INITRD) $(BOOT_INITRD): $(ROOTFS_TAR) $(KERNEL_APK) $(EXTRA_APKS) $(ENVD) $(VSOCKFWD) cmd/mkimage/main.go internal/cpio/writer.go
 	$(GO) run ./cmd/mkimage -rootfs $(ROOTFS_TAR) -kernel-apk $(KERNEL_APK) -overlay $(OVERLAY) -out $(GUEST_DIR) \
 		-apks $(subst $(eval) ,$(comma),$(EXTRA_APKS))
 comma := ,
@@ -94,10 +113,28 @@ snapshot: build image
 restore: build
 	./$(BIN) restore -snapshot $(SNAP) -n $(or $(N),1,5,10)
 
-# Phase 4+5: the E2B-compatible control plane. Point the stock SDK at it:
+# Phase 6: the template disk. Boots the full initramfs with a blank image
+# attached; the guest formats it, copies itself in and apk adds GUEST_PKGS.
+# Needs network. ~10 s.
+disk: $(ROOTFS_IMG)
+
+$(ROOTFS_IMG): $(BIN) $(KERNEL) $(INITRD)
+	./$(BIN) mkdisk -kernel $(KERNEL) -initrd $(INITRD) -out $@ -size $(DISK_MB) -pkgs "$(GUEST_PKGS)"
+
+# Phase 4-6: the E2B-compatible control plane. Point the stock SDK at it:
 #   E2B_API_KEY=anything E2B_API_URL=http://localhost:3000 E2B_SANDBOX_URL=http://localhost:49983
-serve: build
-	./$(BIN) serve -snapshot $(SNAP)
+# Port 3000 taken (a Next.js dev server, say)? `make serve smoke API_PORT=3100`.
+serve: build image disk
+	./$(BIN) serve -kernel $(KERNEL) -initrd $(BOOT_INITRD) -disk $(ROOTFS_IMG) -mem $(SANDBOX_MEM) -cpus $(CPUS) \
+		-api 127.0.0.1:$(API_PORT) -envd 127.0.0.1:$(ENVD_PORT)
+
+# End-to-end check of an agent-style workload against a running `make serve`:
+# python, pip, git, curl, node, sudo, files, pause/resume.
+smoke: sdk-venv-check
+	$(SDK_ENV) $(VENV)/bin/python scripts/smoke.py
+
+sdk-venv-check:
+	@test -x $(VENV)/bin/python || { echo "no $(VENV): run make sdk-venv first"; exit 1; }
 
 # Run the E2B Python SDK's sandbox tests against a running `make serve`.
 # Needs a venv with the SDK: make sdk-venv (uses python3.13 from Homebrew).
@@ -109,11 +146,11 @@ sdk-venv:
 
 SDK_TESTS ?= tests/sync/sandbox_sync/test_create.py tests/sync/sandbox_sync/test_connect.py tests/sync/sandbox_sync/test_kill.py tests/sync/sandbox_sync/test_timeout.py tests/sync/sandbox_sync/commands tests/sync/sandbox_sync/files
 sdk-test:
-	cd $(E2B_SDK) && env -u E2B_DEBUG E2B_API_KEY=test E2B_API_URL=http://localhost:3000 E2B_SANDBOX_URL=http://localhost:49983 \
+	cd $(E2B_SDK) && env -u E2B_DEBUG $(SDK_ENV) \
 		$(abspath $(VENV))/bin/python -m pytest -p no:cacheprovider --timeout 120 -q -rfE $(SDK_TESTS)
 
 clean:
-	rm -rf bin $(GUEST_DIR) $(OVERLAY) $(SNAP)
+	rm -rf bin $(GUEST_DIR) $(OVERLAY) $(SNAP) build/sandboxes
 
 distclean: clean
 	rm -rf build

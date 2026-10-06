@@ -70,7 +70,7 @@ func snapshotCmd(args []string) error {
 
 	abs := func(p string) string { a, _ := filepath.Abs(p); return a }
 	meta := snapshot.Meta{
-		Kernel: abs(o.kernel), Initrd: abs(o.initrd), Cmdline: o.cmdline,
+		Kernel: abs(o.kernel), Initrd: abs(o.initrd), Cmdline: o.cmdline, Disk: absIf(o.disk),
 		MemMiB: o.mem, CPUs: o.cpus, MAC: g.m.MAC(), MachineID: g.m.MachineID(),
 		EnvdVersion: hdr.Get("X-Envd-Version"), Created: time.Now(),
 	}
@@ -106,6 +106,7 @@ func restore(args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	dir := fs.String("snapshot", "build/snap", "snapshot directory from `thimble snapshot`")
 	ns := fs.String("n", "1,5,10", "comma-separated group sizes to restore")
+	diskOverride := fs.String("disk", "", "attach this disk instead of the one recorded in the snapshot (tests restore with a cloned image)")
 	cmd := fs.String("cmd", "echo hello from $(hostname) pid $$", "command to run in each restored sandbox, empty to skip")
 	keep := fs.Bool("keep", false, "leave the last group running (Ctrl-C to stop)")
 	squeeze := fs.Uint64("idle", 96, "after restore, inflate the balloon so the guest keeps only this many MiB; stays inflated (0 = off)")
@@ -135,6 +136,9 @@ func restore(args []string) error {
 		var sumRes, sumFoot uint64
 		tGroup := time.Now()
 		for i := 0; i < n; i++ {
+			if *diskOverride != "" {
+				meta.Disk = *diskOverride
+			}
 			r, err := restoreOne(meta, state, *cmd, *squeeze)
 			if err != nil {
 				for _, s := range sbx {
@@ -196,7 +200,7 @@ func restoreOne(meta snapshot.Meta, state, cmd string, squeezeMiB uint64) (*rest
 
 	before, _ := hostmem.Helpers()
 	m, err := vm.New(vm.Config{
-		Kernel: meta.Kernel, Initrd: meta.Initrd, Cmdline: meta.Cmdline,
+		Kernel: meta.Kernel, Initrd: meta.Initrd, Cmdline: meta.Cmdline, Disk: meta.Disk,
 		CPUs: meta.CPUs, MemoryMiB: meta.MemMiB, MAC: meta.MAC, MachineID: meta.MachineID,
 		ConsoleIn: inR, ConsoleOut: outW,
 	})
@@ -284,4 +288,12 @@ func squeeze(m *vm.Machine, helper int, fullMiB, lowMiB uint64) string {
 	after, _ := hostmem.Of(helper)
 	return fmt.Sprintf("footprint %s -> %s inflated to %d MiB -> %s after deflate, in %.0f ms",
 		hostmem.MiB(before.Footprint), hostmem.MiB(low.Footprint), lowMiB, hostmem.MiB(after.Footprint), ms(time.Since(t0)))
+}
+
+func absIf(p string) string {
+	if p == "" {
+		return ""
+	}
+	a, _ := filepath.Abs(p)
+	return a
 }

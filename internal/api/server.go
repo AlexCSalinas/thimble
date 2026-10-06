@@ -11,6 +11,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -81,6 +83,8 @@ func failErr(w http.ResponseWriter, err error) {
 		fail(w, http.StatusNotFound, "sandbox not found")
 	case errors.Is(err, sandbox.ErrPaused), errors.Is(err, sandbox.ErrNotPaused):
 		fail(w, http.StatusConflict, err.Error())
+	case errors.Is(err, sandbox.ErrFull):
+		fail(w, http.StatusTooManyRequests, err.Error())
 	default:
 		fail(w, http.StatusInternalServerError, err.Error())
 	}
@@ -118,12 +122,12 @@ type sandboxDetail struct {
 	State      sandbox.State     `json:"state"`
 }
 
-func toDetail(s *sandbox.Sandbox) sandboxDetail {
+func (srv *Server) toDetail(s *sandbox.Sandbox) sandboxDetail {
 	return sandboxDetail{
 		sandboxBody: toBody(s),
 		StartedAt:   s.StartedAt.UTC().Format(time.RFC3339Nano),
 		EndAt:       s.EndAt.UTC().Format(time.RFC3339Nano),
-		CPUCount:    s.CPUs, MemoryMB: s.MemMiB, DiskSizeMB: 0,
+		CPUCount:    s.CPUs, MemoryMB: s.MemMiB, DiskSizeMB: srv.mg.DiskMiB(),
 		Metadata: s.Metadata, State: s.State(),
 	}
 }
@@ -150,7 +154,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	sb, err := s.mg.Create(r.Context(), req.TemplateID, time.Duration(timeout)*time.Second, req.Metadata, req.EnvVars, req.AutoPause)
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "create: "+err.Error())
+		failErr(w, fmt.Errorf("create: %w", err))
 		return
 	}
 	writeJSON(w, http.StatusCreated, toBody(sb))
@@ -171,7 +175,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	out := make([]sandboxDetail, 0, len(all))
 	running := 0
 	for _, sb := range all {
-		out = append(out, toDetail(sb))
+		out = append(out, s.toDetail(sb))
 		if sb.State() == sandbox.Running {
 			running++
 		}
@@ -186,7 +190,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toDetail(sb))
+	writeJSON(w, http.StatusOK, s.toDetail(sb))
 }
 
 func (s *Server) kill(w http.ResponseWriter, r *http.Request) {
@@ -291,11 +295,21 @@ func (s *Server) ProxyHandler() http.Handler {
 		}
 		sb, err := s.mg.Get(id)
 		if err != nil && id == "" {
-			// Plain GETs of signed download URLs carry no header at all
-			// (urllib, curl, a browser). E2B routes those by hostname. With
-			// one shared localhost URL the only thing left is: if exactly
+			// Plain GETs and POSTs of signed file URLs carry no header at
+			// all (urllib, curl, a browser). E2B routes those by hostname.
+			// With one shared localhost URL the signature itself is the
+			// routing key: it is a hash over the sandbox's envd access
+			// token, which only one sandbox has. Failing that, if exactly
 			// one sandbox is running, it must be that one.
-			if running := s.mg.List(nil, []sandbox.State{sandbox.Running}); len(running) == 1 {
+			running := s.mg.List(nil, []sandbox.State{sandbox.Running})
+			if sig := r.URL.Query().Get("signature"); sig != "" {
+				for _, cand := range running {
+					if fileSignature(r, cand.AccessToken) == sig {
+						sb, err = cand, nil
+						break
+					}
+				}
+			} else if len(running) == 1 {
 				sb, err = running[0], nil
 			}
 		}
@@ -373,6 +387,23 @@ func (b *eofBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// fileSignature recomputes the SDK's v1 URL signature for a /files request
+// (e2b/sandbox/signature.py): "v1_" + unpadded base64 of
+// sha256("<path>:<read|write>:<username>:<token>[:<expiration>]").
+func fileSignature(r *http.Request, token string) string {
+	q := r.URL.Query()
+	op := "read"
+	if r.Method != http.MethodGet {
+		op = "write"
+	}
+	raw := q.Get("path") + ":" + op + ":" + q.Get("username") + ":" + token
+	if exp := q.Get("signature_expiration"); exp != "" {
+		raw += ":" + exp
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return "v1_" + base64.RawStdEncoding.EncodeToString(sum[:])
+}
+
 func logRequests(h http.Handler, logf func(string, ...any)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t0 := time.Now()
@@ -423,5 +454,3 @@ func Serve(ctx context.Context, s *Server, apiAddr, envdAddr string) error {
 		return nil
 	}
 }
-
-var _ = fmt.Sprintf

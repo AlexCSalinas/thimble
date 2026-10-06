@@ -424,3 +424,151 @@ the memory file against the template so only changed pages are uploaded. It
 has to be, because its snapshots go to object storage and are restored on
 another machine; thimble's go to a local directory and come back on the
 same one.
+
+## Phase 6: a sandbox an agent can use
+
+Phases 1 to 5 proved the mechanics on a 20 MiB initramfs with no network.
+An agent needs `pip install`, `git clone`, `curl`, node, and a disk that
+keeps what it writes. This phase adds those and, in doing so, changes what
+"create sandbox" means on this host.
+
+### Networking: one module and one hard limit
+
+Outbound networking was a single missing kernel module. Alpine's virt
+kernel builds `CONFIG_PACKET` as a module and udhcpc needs an `AF_PACKET`
+socket to broadcast DHCP DISCOVER; without `af_packet.ko` it fails with
+"Address family not supported by protocol". With it, the framework's NAT
+hands out a lease from `192.168.64.1` in ~50 ms and TCP, UDP, HTTPS all
+work. `/init` starts `udhcpc -b` in the background so envd is not held up.
+
+Then the finding that shaped the rest of the phase. Two experiments:
+
+1. A restore rejects any configuration change, MAC included (`VZErrorDomain
+   Code=12 "invalid argument"` with a different MAC in `snapshot.json`).
+2. The NAT delivers frames only to the MAC the device was configured with.
+   `ip link set eth0 address` inside the guest kills its connectivity, and
+   two sandboxes restored from one snapshot get the same lease
+   (`192.168.64.6` for both) and only one of them can reach the network.
+
+So N sandboxes restored from one snapshot cannot all have networking. E2B
+does not have this problem: every Firecracker sandbox lives in its own
+network namespace with the same private IP, NATed to a per-sandbox slot
+address by the host's iptables. vmnet offers no equivalent.
+
+Two ways out: a pool of per-MAC snapshots (K slots, each snapshotted with
+its own MAC and its own base disk; create picks a free slot), or a cold boot
+per create with a fresh random MAC. Measured against the disk template:
+
+| create strategy        | create latency | host footprint after create |
+|------------------------|----------------|-----------------------------|
+| restore (phase 3)      | ~250 ms        | ~360 MiB (every page written) |
+| cold boot from disk    | ~600 ms        | ~140 MiB (only touched pages) |
+
+Cold boot won: 350 ms slower, 2.5x cheaper in RAM, no slot bookkeeping,
+no stale DHCP leases inside snapshots. Pause and resume are unchanged, per
+sandbox, with that sandbox's own MAC. The slot pool is the way back to
+restore-based create if latency ever matters more than memory.
+
+### The disk: the guest formats it
+
+macOS has no `mkfs.ext4`. `thimble mkdisk` creates a sparse raw file, boots
+the full initramfs with it attached and `thimble.mkdisk=1 thimble.pkgs=...`
+on the kernel command line, and `/init` does the rest: `apk add e2fsprogs`
+into the RAM root, `mkfs.ext4`, copy the initramfs root onto the disk,
+`chroot` + `apk add` the package list from the Alpine mirror, create the
+`user` account with passwordless sudo, delete python's `EXTERNALLY-MANAGED`
+marker so `pip install` works, power off. ~10 s, 220 MiB allocated of a 4
+GiB sparse image. E2B builds templates by extracting an OCI image into
+ext4 on the Linux host (`pkg/template/build`); here the only Linux around
+is the guest.
+
+Two gotchas: ext4's mount needs `crc32c` (`crc32c_generic` + `libcrc32c`
+modules; the error is "Cannot load crc32c driver" and the mount fails with
+ENOENT), and `( set -e; ... ) && ok || fail` silently disables `set -e`
+inside the subshell, so the first build reported success with an empty
+disk. The result is checked through `$?` now.
+
+Each sandbox boots `boot.cpio.gz` (minirootfs + modules, 5 MiB; the 11 MiB
+full image is only for `boot`/`run`/`snapshot`/`mkdisk`) with
+`thimble.root=/dev/vda`. `/init` loads the modules, mounts the disk and
+`switch_root`s to the same script on the disk, which then runs its normal
+path with guards for the mounts and modules that already exist.
+
+Per-sandbox disks are APFS clones (`clonefile(2)`) of the template image:
+instant, copy-on-write, and the framework locks each open image, which is
+why two sandboxes cannot share one file. `mkfs` runs with
+`lazy_itable_init=0` so the kernel's `ext4lazyinit` thread does not spend
+every sandbox's first minutes dirtying COW blocks. Kill deletes the clone;
+pause keeps it and writes the memory state next to it, so a paused sandbox
+is a directory, not a process.
+
+### DNS
+
+After a resume the host's own resolver (the NAT gateway, mDNSResponder on
+`192.168.64.1`) ignores UDP from the sandbox for about two seconds; TCP,
+ICMP and UDP to the internet work from the first packet, and the same stall
+sometimes appears right after a cold boot. Probed by sending raw DNS
+queries at 150 ms intervals after resume: host resolver dead until t+2.2 s,
+`1.1.1.1` answering at t+0. Disabling checksum offload changed nothing.
+musl's resolver queries every nameserver in parallel and would hide it, but
+curl uses c-ares, which waits 2 s before trying the next server, so the
+first `curl` in a sandbox stalled. The guest now uses `1.1.1.1` and
+`8.8.8.8` directly (`RESOLV_CONF="no"` in `/etc/udhcpc/udhcpc.conf`), at
+~10 ms per lookup instead of 2 ms, and a VPN's private names are not
+resolvable from inside a sandbox. Deleting that line in the template brings
+the host's DNS back.
+
+### Two small things the SDK test suite caught
+
+- Signed download URLs (`sandbox.download_url(path)`) carry no
+  `E2b-Sandbox-Id` header and are opened by `urllib`. Phase 4 routed them to
+  "the only running sandbox", which stops working as soon as two are up. The
+  signature is `sha256("<path>:<read|write>:<user>:<envd access token>[:<exp>]")`
+  (`e2b/sandbox/signature.py`), and the proxy knows every sandbox's token, so
+  it recomputes the signature per running sandbox and routes to the match.
+  E2B never needs this: its hostnames carry the sandbox id.
+- `coreutils` replaced busybox's `chmod`, and GNU `chmod 0755` on a directory
+  keeps an existing setgid bit (a documented POSIX allowance). busybox
+  `adduser` creates `/home/user` as `02755`, so every subdirectory came back
+  from envd as `dgrwxr-xr-x` again. `chmod g-s,0755` clears it in both
+  implementations.
+
+### Measurements (`make smoke`, M2 8 GB)
+
+```
+create                        0.6 s    footprint 139 MiB
+python3 -c ...                0.08 s
+curl https://example.com      0.12 s   (first lookup in the sandbox included)
+pip install requests          2.1 s
+git clone (small repo)        0.45 s
+pause                         0.6 s    state file 68 MiB, footprint -> 0
+resume (Sandbox.connect)      0.4 s    footprint 625 MiB (restore writes every page of the 512 MiB guest)
+whole smoke run               6 s
+```
+
+The resume footprint is the phase 3 problem again: a restore materialises
+the whole guest. `serve -idle N` inflates the balloon after a resume, but a
+guest capped at N MiB thereafter is a bad trade for an agent that may
+`pip install` something large, so the default is off and macOS's compressor
+is left to reclaim the zero pages over the following seconds.
+
+### SDK test results (`make sdk-test`, sync create/connect/kill/timeout + commands + files)
+
+112 passed, 2 failed. The phase 4 failures for `sudo` and `python3` are gone
+(both are in the template now), and so is the xattr metadata one. The two
+left are the same two as before: `test_auto_pause_filesystem_only_reboots`
+(`keep_memory=False` means "drop memory, reboot from disk on resume"; the
+disk exists now, so this is implementable: a resume with no state file is a
+cold boot of the sandbox's own clone) and
+`test_auto_resume_wakes_on_http_request` (needs an ingress that resumes a
+paused sandbox on the first packet to `https://8000-<id>.<domain>`).
+
+### What this is not
+
+One template (`templateID` is accepted, not resolved), one sandbox size,
+no inbound ports (`sandbox.get_host(port)` has no ingress to point at), no
+persistence across a `thimble serve` restart (the sandbox table is in
+memory; stale directories are deleted at startup), and no resource limits
+beyond `-max`. The code-interpreter SDK (`run_code`) needs a Jupyter kernel
+in the template; the plain `e2b` SDK's `commands.run("python3 ...")` is
+what works today.

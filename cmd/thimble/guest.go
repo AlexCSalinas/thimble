@@ -20,9 +20,12 @@ const readyMarker = "THIMBLE_BOOT_OK"
 // launchOpts is what every subcommand needs to bring a guest up.
 type launchOpts struct {
 	kernel, initrd, cmdline string
+	disk                    string // optional raw image for virtio-blk
 	mem                     uint64
 	cpus                    uint
-	echo                    bool // copy guest console to stdout
+	echo                    bool      // copy guest console to stdout
+	tee                     io.Writer // optional second sink for console output
+	noWait                  bool      // return right after Start instead of waiting for the ready marker
 	timeout                 time.Duration
 }
 
@@ -63,14 +66,14 @@ func launch(o launchOpts) (*guest, error) {
 	}
 	m, err := vm.New(vm.Config{
 		Kernel: o.kernel, Initrd: o.initrd, Cmdline: o.cmdline,
-		CPUs: o.cpus, MemoryMiB: o.mem,
+		CPUs: o.cpus, MemoryMiB: o.mem, Disk: o.disk,
 		ConsoleIn: inR, ConsoleOut: outW,
 	})
 	if err != nil {
 		return nil, err
 	}
 	g := &guest{m: m, consoleW: inW, readyCh: make(chan ready, 1), firstCh: make(chan time.Time, 1)}
-	go watchConsole(outR, o.echo, g.firstCh, g.readyCh)
+	go watchConsole(outR, o.echo, o.tee, g.firstCh, g.readyCh)
 
 	// The guest's memory lives in a framework helper process, not in ours.
 	// Snapshot the helper pids around Start to learn which one is ours.
@@ -83,6 +86,9 @@ func launch(o launchOpts) (*guest, error) {
 	}
 	helpersAfter, _ := hostmem.Helpers()
 	g.helper = hostmem.NewHelper(helpersBefore, helpersAfter)
+	if o.noWait {
+		return g, nil
+	}
 
 	select {
 	case g.tFirst = <-g.firstCh:
@@ -149,7 +155,7 @@ func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond)
 
 // watchConsole copies guest output to stdout and signals the first byte and
 // the ready marker line.
-func watchConsole(r io.Reader, echo bool, firstByte chan<- time.Time, readyCh chan<- ready) {
+func watchConsole(r io.Reader, echo bool, tee io.Writer, firstByte chan<- time.Time, readyCh chan<- ready) {
 	var (
 		first   = true
 		seen    = false
@@ -165,6 +171,9 @@ func watchConsole(r io.Reader, echo bool, firstByte chan<- time.Time, readyCh ch
 			}
 			if echo {
 				os.Stdout.Write(buf[:n])
+			}
+			if tee != nil {
+				tee.Write(buf[:n])
 			}
 			if !seen {
 				lineBuf.Write(buf[:n])

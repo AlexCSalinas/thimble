@@ -41,6 +41,8 @@ func main() {
 		err = restore(os.Args[2:])
 	case "serve":
 		err = serve(os.Args[2:])
+	case "mkdisk":
+		err = mkdisk(os.Args[2:])
 	case "limits":
 		minMem, maxMem, minCPU, maxCPU := vm.Limits()
 		fmt.Printf("memory: %s .. %s\ncpus:   %d .. %d\n", hostmem.MiB(minMem), hostmem.MiB(maxMem), minCPU, maxCPU)
@@ -60,7 +62,8 @@ func usage() {
   thimble run    [same flags] [-user U] [-cwd D] -- cmd [args...]
   thimble snapshot [same flags] [-out DIR]
   thimble restore  [-snapshot DIR] [-n 1,5,10] [-cmd S] [-keep]
-  thimble serve    [-snapshot DIR] [-api ADDR] [-envd ADDR] [-idle MiB] [-api-key K]
+  thimble mkdisk   [same flags] [-out IMG] [-size MiB] [-pkgs "a b c"]
+  thimble serve    [-kernel K] [-initrd I] [-disk IMG] [-mem MiB] [-cpus N] [-data DIR] [-api ADDR] [-envd ADDR] [-api-key K]
   thimble limits`)
 }
 
@@ -71,9 +74,10 @@ func guestFlags(fs *flag.FlagSet) func(echo bool) launchOpts {
 	cmdline := fs.String("cmdline", "console=hvc0 loglevel=4 panic=-1", "kernel command line")
 	mem := fs.Uint64("mem", 256, "guest memory in MiB")
 	cpus := fs.Uint("cpus", 1, "guest vCPUs")
+	disk := fs.String("disk", "", "raw disk image to attach as /dev/vda (optional)")
 	timeout := fs.Duration("timeout", 30*time.Second, "give up if the guest is not ready in time")
 	return func(echo bool) launchOpts {
-		return launchOpts{kernel: *kernel, initrd: *initrd, cmdline: *cmdline, mem: *mem, cpus: *cpus, echo: echo, timeout: *timeout}
+		return launchOpts{kernel: *kernel, initrd: *initrd, cmdline: *cmdline, disk: *disk, mem: *mem, cpus: *cpus, echo: echo, timeout: *timeout}
 	}
 }
 

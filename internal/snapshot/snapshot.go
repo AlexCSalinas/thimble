@@ -20,6 +20,7 @@ type Meta struct {
 	Kernel      string    `json:"kernel"`
 	Initrd      string    `json:"initrd"`
 	Cmdline     string    `json:"cmdline"`
+	Disk        string    `json:"disk,omitempty"` // base disk image the state was saved with; sandboxes attach a clone
 	MemMiB      uint64    `json:"memMiB"`
 	CPUs        uint      `json:"cpus"`
 	MAC         string    `json:"mac"`
