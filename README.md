@@ -154,3 +154,8 @@ internal/envd    a minimal client for envd's REST and Connect RPC endpoints
 internal/snapshot, internal/cpio, internal/hostmem, internal/rawterm
 scripts/smoke.py the end-to-end check
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE). The guest runs E2B's `envd`, which is built
+from E2B's own repository under its own license and is not part of this one.
