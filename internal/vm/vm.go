@@ -41,6 +41,12 @@ type Config struct {
 	// ConsoleIn/ConsoleOut back the guest's hvc0. Either may be nil, in which
 	// case that direction is left unattached.
 	ConsoleIn, ConsoleOut *os.File
+
+	// NetFile, when set, is one end of a connected datagram socket that
+	// carries the guest's ethernet frames (the framework's file-handle
+	// attachment) instead of the framework's NAT. The caller owns the
+	// other end.
+	NetFile *os.File
 }
 
 type Machine struct {
@@ -124,11 +130,16 @@ func New(cfg Config) (*Machine, error) {
 	}
 	vmc.SetMemoryBalloonDevicesVirtualMachineConfiguration([]vz.MemoryBalloonDeviceConfiguration{bal})
 
-	nat, err := vz.NewNATNetworkDeviceAttachment()
+	var att vz.NetworkDeviceAttachment
+	if cfg.NetFile != nil {
+		att, err = vz.NewFileHandleNetworkDeviceAttachment(cfg.NetFile)
+	} else {
+		att, err = vz.NewNATNetworkDeviceAttachment()
+	}
 	if err != nil {
 		return nil, err
 	}
-	nic, err := vz.NewVirtioNetworkDeviceConfiguration(nat)
+	nic, err := vz.NewVirtioNetworkDeviceConfiguration(att)
 	if err != nil {
 		return nil, err
 	}

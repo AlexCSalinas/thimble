@@ -37,6 +37,7 @@ import (
 	"github.com/alexcsalinas/thimble/internal/hostmem"
 	"github.com/alexcsalinas/thimble/internal/snapshot"
 	"github.com/alexcsalinas/thimble/internal/vm"
+	"github.com/alexcsalinas/thimble/internal/vnet"
 )
 
 var (
@@ -70,6 +71,7 @@ type Sandbox struct {
 	state     State
 	m         *vm.Machine
 	helper    int
+	vnet      *vnet.Net       // this sandbox's private network, when Config.VNet is set
 	transport *http.Transport // HTTP over this sandbox's vsock, for the proxy
 	timer     *time.Timer
 	dir       string        // <DataDir>/<id>: rootfs.img clone, and state.vzvmstate while paused
@@ -116,6 +118,7 @@ type Config struct {
 	DataDir      string // per-sandbox directories live here
 	IdleMiB      uint64 // balloon target after a resume from pause (0 = leave the balloon alone)
 	MaxSandboxes int    // running + paused; 0 = unlimited
+	VNet         bool   // give each sandbox a private userspace network (internal/vnet) instead of the framework's NAT
 	Logf         func(format string, a ...any)
 }
 
@@ -240,28 +243,50 @@ func (mg *Manager) start(ctx context.Context, s *Sandbox, state string) error {
 	}
 	go io.Copy(io.Discard, outR)
 
+	var vn *vnet.Net
+	var netFile *os.File
+	if mg.cfg.VNet {
+		// The network's DHCP lease is keyed on the NIC's MAC, so the MAC has
+		// to exist before the VM does.
+		if s.meta.MAC == "" {
+			s.meta.MAC = randomMAC()
+		}
+		if vn, netFile, err = vnet.New(s.meta.MAC); err != nil {
+			return err
+		}
+	}
+	fail := func(err error) error {
+		if vn != nil {
+			vn.Close()
+		}
+		if netFile != nil {
+			netFile.Close()
+		}
+		return err
+	}
+
 	before, _ := hostmem.Helpers()
 	m, err := vm.New(vm.Config{
 		Kernel: s.meta.Kernel, Initrd: s.meta.Initrd, Cmdline: s.meta.Cmdline, Disk: s.meta.Disk,
 		CPUs: s.meta.CPUs, MemoryMiB: s.meta.MemMiB, MAC: s.meta.MAC, MachineID: s.meta.MachineID,
-		ConsoleIn: inR, ConsoleOut: outW,
+		ConsoleIn: inR, ConsoleOut: outW, NetFile: netFile,
 	})
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	// First boot: the framework picked a MAC and machine id; a later resume
 	// from a paused state must present the same ones.
 	s.meta.MAC, s.meta.MachineID = m.MAC(), m.MachineID()
 	if state == "" {
 		if err := m.Start(); err != nil {
-			return fmt.Errorf("start: %w", err)
+			return fail(fmt.Errorf("start: %w", err))
 		}
 	} else {
 		if err := m.Restore(state); err != nil {
-			return fmt.Errorf("restore: %w", err)
+			return fail(fmt.Errorf("restore: %w", err))
 		}
 		if err := m.Resume(); err != nil {
-			return fmt.Errorf("resume: %w", err)
+			return fail(fmt.Errorf("resume: %w", err))
 		}
 	}
 	after, _ := hostmem.Helpers()
@@ -281,7 +306,7 @@ func (mg *Manager) start(ctx context.Context, s *Sandbox, state string) error {
 	defer cancel()
 	if err := c.WaitHealthy(hctx); err != nil {
 		m.Stop()
-		return err
+		return fail(err)
 	}
 	// /init sets the access token the SDK will present on every envd call,
 	// the default user/workdir, env vars, and the guest clock (which, after a
@@ -292,7 +317,7 @@ func (mg *Manager) start(ctx context.Context, s *Sandbox, state string) error {
 	})
 	if err != nil {
 		m.Stop()
-		return fmt.Errorf("envd init: %w", err)
+		return fail(fmt.Errorf("envd init: %w", err))
 	}
 	if v := hdr.Get("X-Envd-Version"); v != "" {
 		s.EnvdVersion = v
@@ -312,7 +337,7 @@ func (mg *Manager) start(ctx context.Context, s *Sandbox, state string) error {
 	}
 
 	s.mu.Lock()
-	s.m, s.transport, s.helper, s.state = m, tr, hostmem.NewHelper(before, after), Running
+	s.m, s.transport, s.helper, s.state, s.vnet = m, tr, hostmem.NewHelper(before, after), Running, vn
 	s.mu.Unlock()
 	return nil
 }
@@ -342,6 +367,22 @@ func (mg *Manager) waitNetwork(ctx context.Context, c *envd.Client) {
 
 // networkWait caps how long create waits for the guest network.
 const networkWait = 6 * time.Second
+
+// randomMAC returns a random locally administered unicast MAC.
+func randomMAC() string {
+	b := make([]byte, 6)
+	rand.Read(b)
+	b[0] = b[0]&^1 | 2
+	return net.HardwareAddr(b).String()
+}
+
+// closeNet tears down the sandbox's private network, if it has one.
+func (s *Sandbox) closeNet() {
+	if s.vnet != nil {
+		s.vnet.Close()
+		s.vnet = nil
+	}
+}
 
 // cloneFile makes dst a copy-on-write clone of src (APFS clonefile: instant,
 // shares blocks until written). Falls back to a plain copy on filesystems
@@ -436,6 +477,7 @@ func (mg *Manager) Kill(id string) error {
 		s.m.WaitStopped(10 * time.Second) // the image is locked until the helper lets go
 		s.m = nil
 	}
+	s.closeNet()
 	os.RemoveAll(s.dir)
 	s.mu.Unlock()
 	mg.cfg.Logf("kill %s", id)
@@ -517,6 +559,7 @@ func (mg *Manager) Pause(id string) error {
 	s.m.Stop()
 	s.m.WaitStopped(10 * time.Second)
 	st, _ := os.Stat(path)
+	s.closeNet()
 	s.m, s.transport, s.helper, s.state = nil, nil, 0, Paused
 	mg.cfg.Logf("pause %s: footprint %s -> 0 (helper exited), state file %s, took %.0f ms",
 		s.ID, hostmem.MiB(before.Footprint), hostmem.MiB(uint64(st.Size())), ms(time.Since(t0)))
