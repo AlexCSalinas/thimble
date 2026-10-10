@@ -297,6 +297,13 @@ func (mg *Manager) start(ctx context.Context, s *Sandbox, state string) error {
 	if v := hdr.Get("X-Envd-Version"); v != "" {
 		s.EnvdVersion = v
 	}
+	// /init starts udhcpc in the background so envd is not held up, which
+	// means a command run right after create can beat the DHCP lease and the
+	// first DNS answer. Hold create until the guest can resolve a name. Best
+	// effort: an offline host must still get a sandbox, so this is capped.
+	if state == "" {
+		mg.waitNetwork(ctx, envd.New(func(ctx context.Context) (net.Conn, error) { return tr.DialContext(ctx, "", "") }, s.AccessToken))
+	}
 	// A restore materialises every guest page on the host; the balloon
 	// hands the free ones back. A cold boot only touched what it used, so
 	// the balloon is left alone and the guest keeps its full memory.
@@ -309,6 +316,32 @@ func (mg *Manager) start(ctx context.Context, s *Sandbox, state string) error {
 	s.mu.Unlock()
 	return nil
 }
+
+// waitNetwork blocks until the guest has a default route and resolves a
+// name, or networkWait passes. Failure is logged, not returned.
+func (mg *Manager) waitNetwork(ctx context.Context, c *envd.Client) {
+	const script = `for i in $(seq 50); do ip route | grep -q '^default' && getent hosts example.com >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1`
+	nctx, cancel := context.WithTimeout(ctx, networkWait)
+	defer cancel()
+	t0 := time.Now()
+	code := int32(-1)
+	err := c.Start(nctx, envd.ProcessConfig{Cmd: "/bin/sh", Args: []string{"-c", script}}, func(ev envd.Event) {
+		if ev.End != nil {
+			code = ev.End.ExitCode
+		}
+	})
+	switch {
+	case err != nil:
+		mg.cfg.Logf("network wait: %v", err)
+	case code != 0:
+		mg.cfg.Logf("network wait: no DNS after %.0f ms; continuing", ms(time.Since(t0)))
+	default:
+		mg.cfg.Logf("network ready in %.0f ms", ms(time.Since(t0)))
+	}
+}
+
+// networkWait caps how long create waits for the guest network.
+const networkWait = 6 * time.Second
 
 // cloneFile makes dst a copy-on-write clone of src (APFS clonefile: instant,
 // shares blocks until written). Falls back to a plain copy on filesystems
