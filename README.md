@@ -15,6 +15,13 @@ sbx = Sandbox.connect(sbx.sandbox_id)           # exactly where you left off
 The stock E2B SDK talks to it unmodified. Every sandbox is its own kernel,
 its own disk, its own network.
 
+## why
+
+I wanted to study how E2B works and my laptop is an 8 GB M2. No KVM, no
+nested virtualization, no room for Docker plus a Linux VM. So I rebuilt the
+sandbox layer on Apple's hypervisor instead, and it turned out to fit: a
+sandbox only costs the pages it touches.
+
 ## run it
 
 ```sh
