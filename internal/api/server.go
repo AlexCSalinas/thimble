@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/alexcsalinas/thimble/internal/sandbox"
+	"github.com/alexcsalinas/thimble/internal/vnet"
 )
 
 type Server struct {
@@ -50,6 +51,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /sandboxes/{id}", s.auth(s.get))
 	mux.HandleFunc("DELETE /sandboxes/{id}", s.auth(s.kill))
 	mux.HandleFunc("POST /sandboxes/{id}/timeout", s.auth(s.timeout))
+	mux.HandleFunc("PUT /sandboxes/{id}/network", s.auth(s.updateNetwork))
+	mux.HandleFunc("GET /sandboxes/{id}/network/events", s.auth(s.networkEvents))
 	mux.HandleFunc("POST /sandboxes/{id}/pause", s.auth(s.pause))
 	mux.HandleFunc("POST /sandboxes/{id}/resume", s.auth(s.resume))
 	return logRequests(mux, s.logf)
@@ -85,6 +88,8 @@ func failErr(w http.ResponseWriter, err error) {
 		fail(w, http.StatusConflict, err.Error())
 	case errors.Is(err, sandbox.ErrFull):
 		fail(w, http.StatusTooManyRequests, err.Error())
+	case errors.Is(err, sandbox.ErrNoVNet), errors.Is(err, sandbox.ErrBadNetwork):
+		fail(w, http.StatusBadRequest, err.Error())
 	default:
 		fail(w, http.StatusInternalServerError, err.Error())
 	}
@@ -139,10 +144,24 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		AutoPause  bool              `json:"autoPause"`
 		Metadata   map[string]string `json:"metadata"`
 		EnvVars    map[string]string `json:"envVars"`
+		Network    *networkConfig    `json:"network"`
+		// allow_internet_access=false is shorthand for denyOut 0.0.0.0/0.
+		AllowInternetAccess *bool `json:"allow_internet_access"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		fail(w, http.StatusBadRequest, "bad JSON: "+err.Error())
 		return
+	}
+	var spec vnet.Spec
+	if req.Network != nil {
+		var err error
+		if spec, err = req.Network.spec(); err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.AllowInternetAccess != nil && !*req.AllowInternetAccess {
+		spec.DenyOut = append(spec.DenyOut, vnet.AllTraffic)
 	}
 	if req.TemplateID == "" {
 		fail(w, http.StatusBadRequest, "templateID is required")
@@ -152,12 +171,67 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	if req.Timeout != nil {
 		timeout = *req.Timeout
 	}
-	sb, err := s.mg.Create(r.Context(), req.TemplateID, time.Duration(timeout)*time.Second, req.Metadata, req.EnvVars, req.AutoPause)
+	sb, err := s.mg.Create(r.Context(), req.TemplateID, time.Duration(timeout)*time.Second, req.Metadata, req.EnvVars, req.AutoPause, spec)
 	if err != nil {
 		failErr(w, fmt.Errorf("create: %w", err))
 		return
 	}
 	writeJSON(w, http.StatusCreated, toBody(sb))
+}
+
+// networkConfig is the part of E2B's SandboxNetworkConfig and
+// SandboxNetworkUpdateConfig that thimble enforces: egress allow and deny
+// lists. Per-host request transforms (rules) and the egress proxy need TLS
+// interception and a SOCKS client, so they are refused rather than ignored.
+type networkConfig struct {
+	AllowOut    []string        `json:"allowOut"`
+	DenyOut     []string        `json:"denyOut"`
+	Rules       map[string]any  `json:"rules"`
+	EgressProxy json.RawMessage `json:"egressProxy"`
+	AllowNet    *bool           `json:"allow_internet_access"`
+}
+
+func (c *networkConfig) spec() (vnet.Spec, error) {
+	if len(c.Rules) > 0 {
+		return vnet.Spec{}, errors.New("network.rules (request transforms) are not supported yet")
+	}
+	if len(c.EgressProxy) > 0 && string(c.EgressProxy) != "null" {
+		return vnet.Spec{}, errors.New("network.egressProxy is not supported yet")
+	}
+	spec := vnet.Spec{AllowOut: c.AllowOut, DenyOut: c.DenyOut}
+	if c.AllowNet != nil && !*c.AllowNet {
+		spec.DenyOut = append(spec.DenyOut, vnet.AllTraffic)
+	}
+	return spec, nil
+}
+
+func (s *Server) updateNetwork(w http.ResponseWriter, r *http.Request) {
+	var c networkConfig
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		fail(w, http.StatusBadRequest, "bad JSON: "+err.Error())
+		return
+	}
+	spec, err := c.spec()
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.mg.UpdateNetwork(r.PathValue("id"), spec); err != nil {
+		failErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// networkEvents is a thimble extension: the sandbox's recent connections and
+// the verdict on each, for seeing what an agent actually reached for.
+func (s *Server) networkEvents(w http.ResponseWriter, r *http.Request) {
+	sb, err := s.mg.Get(r.PathValue("id"))
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"policy": sb.NetworkPolicy(), "events": sb.NetEvents()})
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {

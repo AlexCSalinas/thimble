@@ -41,10 +41,12 @@ import (
 )
 
 var (
-	ErrNotFound  = errors.New("sandbox not found")
-	ErrNotPaused = errors.New("sandbox is not paused")
-	ErrPaused    = errors.New("sandbox is paused")
-	ErrFull      = errors.New("sandbox limit reached")
+	ErrNotFound   = errors.New("sandbox not found")
+	ErrNotPaused  = errors.New("sandbox is not paused")
+	ErrPaused     = errors.New("sandbox is paused")
+	ErrFull       = errors.New("sandbox limit reached")
+	ErrNoVNet     = errors.New("network policy needs the userspace network: start the server with -vnet")
+	ErrBadNetwork = errors.New("invalid network config")
 )
 
 type State string
@@ -72,6 +74,8 @@ type Sandbox struct {
 	m         *vm.Machine
 	helper    int
 	vnet      *vnet.Net       // this sandbox's private network, when Config.VNet is set
+	policy    *vnet.Policy    // egress rules; outlives the VM so a resume keeps them
+	events    []vnet.Event    // connections from before the last pause
 	transport *http.Transport // HTTP over this sandbox's vsock, for the proxy
 	timer     *time.Timer
 	dir       string        // <DataDir>/<id>: rootfs.img clone, and state.vzvmstate while paused
@@ -119,6 +123,7 @@ type Config struct {
 	IdleMiB      uint64 // balloon target after a resume from pause (0 = leave the balloon alone)
 	MaxSandboxes int    // running + paused; 0 = unlimited
 	VNet         bool   // give each sandbox a private userspace network (internal/vnet) instead of the framework's NAT
+	NetLog       bool   // with VNet: log allowed connections too (denials are always logged)
 	Logf         func(format string, a ...any)
 }
 
@@ -180,8 +185,15 @@ func newToken() string {
 }
 
 // Create clones the template disk and boots a new sandbox from it.
-func (mg *Manager) Create(ctx context.Context, templateID string, timeout time.Duration, metadata, envVars map[string]string, autoPause bool) (*Sandbox, error) {
-	s := &Sandbox{
+func (mg *Manager) Create(ctx context.Context, templateID string, timeout time.Duration, metadata, envVars map[string]string, autoPause bool, netSpec vnet.Spec) (*Sandbox, error) {
+	pol, err := vnet.NewPolicy(netSpec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadNetwork, err)
+	}
+	if !mg.cfg.VNet && pol.Enforcing() {
+		return nil, ErrNoVNet
+	}
+	s := &Sandbox{policy: pol,
 		ID: newID(), TemplateID: templateID, Metadata: metadata, EnvVars: envVars,
 		AccessToken: newToken(), AutoPause: autoPause,
 		CPUs: mg.cfg.CPUs, MemMiB: mg.cfg.MemMiB,
@@ -207,7 +219,7 @@ func (mg *Manager) Create(ctx context.Context, templateID string, timeout time.D
 	mg.mu.Unlock()
 
 	t0 := time.Now()
-	err := os.MkdirAll(s.dir, 0o755)
+	err = os.MkdirAll(s.dir, 0o755)
 	if err == nil {
 		err = cloneFile(mg.cfg.Disk, s.meta.Disk)
 	}
@@ -251,7 +263,10 @@ func (mg *Manager) start(ctx context.Context, s *Sandbox, state string) error {
 		if s.meta.MAC == "" {
 			s.meta.MAC = randomMAC()
 		}
-		if vn, netFile, err = vnet.New(s.meta.MAC); err != nil {
+		if vn, netFile, err = vnet.New(vnet.Options{
+			GuestMAC: s.meta.MAC, Policy: s.policy, Label: s.ID,
+			Logf: mg.cfg.Logf, Verbose: mg.cfg.NetLog,
+		}); err != nil {
 			return err
 		}
 	}
@@ -368,6 +383,41 @@ func (mg *Manager) waitNetwork(ctx context.Context, c *envd.Client) {
 // networkWait caps how long create waits for the guest network.
 const networkWait = 6 * time.Second
 
+// UpdateNetwork replaces a sandbox's egress rules. It takes effect for new
+// connections immediately, whether the sandbox is running or paused.
+func (mg *Manager) UpdateNetwork(id string, spec vnet.Spec) error {
+	s, err := mg.Get(id)
+	if err != nil {
+		return err
+	}
+	if !mg.cfg.VNet {
+		return ErrNoVNet
+	}
+	if err := s.policy.Set(spec); err != nil {
+		return fmt.Errorf("%w: %v", ErrBadNetwork, err)
+	}
+	mg.cfg.Logf("network %s: allowOut=%v denyOut=%v", id, spec.AllowOut, spec.DenyOut)
+	return nil
+}
+
+// NetworkPolicy returns the rules in force for a sandbox.
+func (s *Sandbox) NetworkPolicy() vnet.Spec { return s.policy.Spec() }
+
+// NetEvents returns the sandbox's recent connections, oldest first,
+// including those from before a pause.
+func (s *Sandbox) NetEvents() []vnet.Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := append([]vnet.Event(nil), s.events...)
+	if s.vnet != nil {
+		out = append(out, s.vnet.Events()...)
+	}
+	if len(out) > 256 {
+		out = out[len(out)-256:]
+	}
+	return out
+}
+
 // randomMAC returns a random locally administered unicast MAC.
 func randomMAC() string {
 	b := make([]byte, 6)
@@ -379,6 +429,7 @@ func randomMAC() string {
 // closeNet tears down the sandbox's private network, if it has one.
 func (s *Sandbox) closeNet() {
 	if s.vnet != nil {
+		s.events = append(s.events, s.vnet.Events()...)
 		s.vnet.Close()
 		s.vnet = nil
 	}

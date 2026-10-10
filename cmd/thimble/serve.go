@@ -31,13 +31,14 @@ func serve(args []string) error {
 	envdAddr := fs.String("envd", "127.0.0.1:49983", "envd proxy listen address")
 	idle := fs.Uint64("idle", 0, "after a resume from pause, inflate the balloon so the guest keeps only this many MiB (0 = off)")
 	vnetOn := fs.Bool("vnet", false, "give each sandbox a private userspace network (all traffic passes through this process) instead of the framework NAT")
+	netlog := fs.Bool("netlog", false, "with -vnet, log allowed connections as well as denied ones")
 	apiKey := fs.String("api-key", os.Getenv("THIMBLE_API_KEY"), "required X-API-Key value (empty = accept any non-empty key)")
 	fs.Parse(args)
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	mg, err := sandbox.NewManager(sandbox.Config{
 		Kernel: *kernel, Initrd: *initrd, Disk: *disk, Cmdline: *cmdline,
-		MemMiB: *mem, CPUs: *cpus, DataDir: *data, MaxSandboxes: *max, IdleMiB: *idle, VNet: *vnetOn, Logf: log.Printf,
+		MemMiB: *mem, CPUs: *cpus, DataDir: *data, MaxSandboxes: *max, IdleMiB: *idle, VNet: *vnetOn, NetLog: *netlog, Logf: log.Printf,
 	})
 	if err != nil {
 		return err

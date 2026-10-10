@@ -47,8 +47,33 @@ bin/thimble serve -vnet
 
 Each VM gets a private network that lives inside the thimble process. Every
 frame it sends lands in a userspace TCP/IP stack on the host, so there is no
-other way out. Every sandbox has the same IP, which the NAT cannot do. This is
-the layer for egress policy, logging and secrets, and for forking a running VM.
+other way out, and every sandbox can have the same IP, which the NAT cannot
+do. That makes egress policy real, using E2B's own options:
+
+```python
+sbx = Sandbox.create("base", network={
+    "deny_out": [ALL_TRAFFIC],
+    "allow_out": ["api.github.com", "*.pypi.org", "1.1.1.1"],
+})
+sbx.update_network({"allow_out": ["example.com"], "deny_out": [ALL_TRAFFIC]})
+```
+
+IPs and CIDRs are matched on the destination. Domains are matched on the TLS
+SNI or HTTP Host the client sends, so `https://github.com` is refused before a
+byte reaches it. Allow beats deny. Rules apply to the next connection, and
+survive pause and resume.
+
+Every connection and its verdict is kept per sandbox:
+
+```sh
+curl -H 'X-API-Key: local' localhost:3000/sandboxes/$ID/network/events
+bin/thimble serve -vnet -netlog      # also log allowed connections
+```
+
+`make sdk-venv && build/venv/bin/python scripts/netpolicy.py` runs the checks.
+Not done: request transforms (`rules`, secret injection) and `egressProxy`,
+which need TLS interception. A guest that sends an allowed SNI to a different
+IP gets through, and DNS is not filtered.
 
 ## inside
 
@@ -77,7 +102,7 @@ cmd/thimble      boot, run, snapshot, mkdisk, serve
 cmd/mkimage      guest image and PID 1
 internal/vm      Virtualization.framework
 internal/sandbox lifecycle
-internal/vnet    per-sandbox userspace network
+internal/vnet    per-sandbox userspace network, egress policy
 internal/api     E2B control plane and envd proxy
 ```
 
