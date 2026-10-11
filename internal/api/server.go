@@ -53,6 +53,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes/{id}/timeout", s.auth(s.timeout))
 	mux.HandleFunc("PUT /sandboxes/{id}/network", s.auth(s.updateNetwork))
 	mux.HandleFunc("GET /sandboxes/{id}/network/events", s.auth(s.networkEvents))
+	mux.HandleFunc("POST /sandboxes/{id}/fork", s.auth(s.fork))
 	mux.HandleFunc("POST /sandboxes/{id}/pause", s.auth(s.pause))
 	mux.HandleFunc("POST /sandboxes/{id}/resume", s.auth(s.resume))
 	return logRequests(mux, s.logf)
@@ -88,7 +89,7 @@ func failErr(w http.ResponseWriter, err error) {
 		fail(w, http.StatusConflict, err.Error())
 	case errors.Is(err, sandbox.ErrFull):
 		fail(w, http.StatusTooManyRequests, err.Error())
-	case errors.Is(err, sandbox.ErrNoVNet), errors.Is(err, sandbox.ErrBadNetwork):
+	case errors.Is(err, sandbox.ErrNoVNet), errors.Is(err, sandbox.ErrBadNetwork), errors.Is(err, sandbox.ErrNoFork), errors.Is(err, sandbox.ErrForkArg):
 		fail(w, http.StatusBadRequest, err.Error())
 	default:
 		fail(w, http.StatusInternalServerError, err.Error())
@@ -317,6 +318,32 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mg.ExtendTimeout(sb, timeout)
 	writeJSON(w, http.StatusOK, toBody(sb))
+}
+
+// fork is a thimble extension (E2B has no equivalent): clone a running
+// sandbox into count children that continue from its exact state.
+func (s *Server) fork(w http.ResponseWriter, r *http.Request) {
+	req := struct {
+		Count   int  `json:"count"`
+		Timeout *int `json:"timeout"`
+	}{Count: 1}
+	if r.Body != nil {
+		json.NewDecoder(r.Body).Decode(&req) // optional body
+	}
+	timeout := 300 * time.Second
+	if req.Timeout != nil {
+		timeout = time.Duration(*req.Timeout) * time.Second
+	}
+	kids, err := s.mg.Fork(r.Context(), r.PathValue("id"), req.Count, timeout)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	out := make([]sandboxBody, len(kids))
+	for i, k := range kids {
+		out[i] = toBody(k)
+	}
+	writeJSON(w, http.StatusCreated, out)
 }
 
 func (s *Server) pause(w http.ResponseWriter, r *http.Request) {

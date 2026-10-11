@@ -76,6 +76,7 @@ type Sandbox struct {
 	vnet      *vnet.Net       // this sandbox's private network, when Config.VNet is set
 	policy    *vnet.Policy    // egress rules; outlives the VM so a resume keeps them
 	events    []vnet.Event    // connections from before the last pause
+	forked    bool            // restored from a parent's state: needs fresh entropy
 	transport *http.Transport // HTTP over this sandbox's vsock, for the proxy
 	timer     *time.Timer
 	dir       string        // <DataDir>/<id>: rootfs.img clone, and state.vzvmstate while paused
@@ -336,6 +337,9 @@ func (mg *Manager) start(ctx context.Context, s *Sandbox, state string) error {
 	}
 	if v := hdr.Get("X-Envd-Version"); v != "" {
 		s.EnvdVersion = v
+	}
+	if s.forked {
+		mg.reseed(hctx, envd.New(func(ctx context.Context) (net.Conn, error) { return tr.DialContext(ctx, "", "") }, s.AccessToken))
 	}
 	// /init starts udhcpc in the background so envd is not held up, which
 	// means a command run right after create can beat the DHCP lease and the

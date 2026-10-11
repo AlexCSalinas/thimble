@@ -75,6 +75,27 @@ Not done: request transforms (`rules`, secret injection) and `egressProxy`,
 which need TLS interception. A guest that sends an allowed SNI to a different
 IP gets through, and DNS is not filtered.
 
+## fork
+
+Clone a running sandbox into copies that pick up exactly where it is: same
+memory, same running processes, same disk. Then they diverge.
+
+```sh
+curl -X POST -H 'X-API-Key: local' -d '{"count": 5}' localhost:3000/sandboxes/$ID/fork
+```
+
+The children are ordinary sandboxes, so `Sandbox.connect(child_id)` works.
+Needs `-vnet`: every clone has the same MAC and IP, which only works because
+each VM sits on its own private network. Disks and saved memory are APFS
+clones, so a fork copies nothing until someone writes. The parent is paused
+for about 0.7 s; 5 children are up in about 3 s.
+
+`scripts/fork_demo.py` checks it: a process started before the fork is still
+running in every child, files in RAM and on disk are inherited, writes stay
+private to each copy, and siblings get different random numbers. Open
+connections to the outside do not survive a fork. Children keep the parent's
+envd access token, because envd only accepts a new one with the old one.
+
 ## inside
 
 | | |
