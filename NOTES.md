@@ -572,3 +572,86 @@ memory; stale directories are deleted at startup), and no resource limits
 beyond `-max`. The code-interpreter SDK (`run_code`) needs a Jupyter kernel
 in the template; the plain `e2b` SDK's `commands.run("python3 ...")` is
 what works today.
+
+## Phase 7: userspace network, egress policy, fork
+
+### Why the framework NAT had to go
+
+NOTES phase 6 ended on a hard limit: restored VMs share a MAC, and vmnet's NAT
+delivers frames only to the MAC it was configured with, so only one clone of a
+snapshot can have a network. `-vnet` replaces the NAT with a file-handle NIC
+(a datagram socketpair) and serves it from a userspace TCP/IP stack in the
+thimble process (gVisor netstack, assembled from gvisor-tap-vsock's pieces).
+Each sandbox gets its own copy of that stack on the same subnet with the same
+guest IP, so clones no longer collide. Four sandboxes at the same IP
+`192.168.127.2` all reach the internet at once.
+
+Because every guest connection is terminated in-process, policy is
+enforceable from outside the guest. gvisor-tap-vsock's TCP forwarder dials
+unconditionally, so the stack is built here and only the forwarder is ours.
+Frames need 1 MiB / 4 MiB socket send/receive buffers or the framework drops
+them.
+
+### Policy
+
+E2B's own options, so the stock SDK drives it: `network.allow_out`,
+`deny_out`, `allow_internet_access=False`, `update_network`. Allow beats deny.
+IPs and CIDRs match on the destination. Domains match on what the client
+says: the TLS SNI or HTTP Host. When the destination IP is denied but a
+domain rule exists, the connection is accepted from the guest, its first
+bytes are read (the SNI is extracted by running crypto/tls on the buffered
+ClientHello and stopping at the callback, not by a hand-written parser), and
+only then is the upstream dialled with those bytes replayed. When the IP alone
+decides, the upstream is dialled first so refusals look like refusals.
+
+Gaps, on purpose: a guest can send an allowed SNI to a different IP; DNS is not
+filtered; UDP has no hostname so a domain rule cannot admit it (QUIC falls back
+to TCP); request transforms and `egressProxy` need TLS interception and are
+refused by the API, not ignored. `scripts/netpolicy.py` runs 22 checks modelled
+on the SDK's own network tests.
+
+The `169.254.169.254` connection attempt on every boot is envd asking
+Firecracker's metadata service (MMDS) for an access-token hash. There is none
+here, so it is denied by the metadata block and envd carries on.
+
+### Fork
+
+Pause the parent (memory saved, helper exits, disk flushed), clone the disk and
+the state file per child with `clonefile(2)`, resume the parent, restore each
+child from its clone. The restore accepted a different disk path, and a shared
+MAC is fine because each VM has its own network. Two things the restore does
+not give you for free:
+
+- **Entropy.** The kernel RNG pool is part of the saved memory, so siblings
+  would draw identical random numbers. Each child gets 64 fresh host bytes
+  written to `/dev/urandom` after the restore.
+- **The envd access token.** envd accepts a new token only from a caller that
+  presents the current one (or an MMDS hash, which does not exist here), so a
+  child's `/init` with a fresh token is a 401. Children keep the parent's.
+
+Open connections to the outside die: the guest believes they are up, the host
+side is gone. `scripts/fork_demo.py` checks that a process running before the
+fork is alive in every child, that RAM-only and disk files are inherited, that
+writes stay private, that every child has network, and that siblings differ.
+
+### What a fork costs (M2 8 GB, `scripts/forkmem.py`, 1 parent + 5 children)
+
+`phys_footprint` is what macOS budgets against; RSS is far lower because the
+rest is compressed or swapped. The machine was already holding ~3.4 GB of swap
+and ~2.4 GB of compressor before each run, so absolute system numbers are noisy.
+
+| guest RAM | cold boot | per forked VM | 6 VMs | fork x5 |
+|---|---|---|---|---|
+| 512 MiB | 99-135 MiB | 530-590 MiB | 3.2-3.6 GB | 3-6 s |
+| 256 MiB | 129 MiB | 262 MiB | 1.6 GB | 2.5 s |
+
+- A restored VM costs about its whole RAM ceiling, whether the guest touches it
+  or not: dirtying another 100 MiB in every child changed nothing, because the
+  restore had already materialised it. Fork cost is O(guest RAM), not
+  O(touched pages).
+- `-idle 128` (balloon after restore) trimmed ~10%, not the ~75% the target
+  implies. Pages the host already compressed still count as footprint.
+- The practical knob is `-mem`. At 256 MiB, six VMs fit in 1.6 GB.
+- The real fix is lazy restore: map the state file copy-on-write so untouched
+  pages stay on disk and shared between siblings. Virtualization.framework
+  restores from a file it reads itself, so this may not be reachable from here.
